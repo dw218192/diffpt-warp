@@ -1,0 +1,7 @@
+[project]
+name = "PBR_Renderer"
+version = "0.1.0"
+description = "Simple PBR renderer, as an exercise from "
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["warp-lang", "matplotlib", "numpy", "usd-core", "types-usd"]

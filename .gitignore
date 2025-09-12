@@ -1,0 +1,8 @@
+# imgui config file
+imgui.ini
+
+# extra uv configs
+uv.toml
+
+# local stuff
+_local

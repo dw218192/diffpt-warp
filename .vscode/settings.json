@@ -1,0 +1,6 @@
+{
+    "python.languageServer": "None",
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}/../monte_carlo"
+    ]
+}
