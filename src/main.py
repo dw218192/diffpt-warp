@@ -7,6 +7,7 @@ https://nvidia.github.io/warp/modules/functions.html
 from dataclasses import dataclass
 import logging
 import os
+import pathlib
 
 import numpy as np
 from pxr import Usd, UsdGeom, UsdLux, UsdShade
@@ -20,13 +21,15 @@ from usd_utils import (
     usdmesh_to_wpmesh,
 )
 
+from sampling import hemisphere_sample, hemisphere_pdf, get_coord_system
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
 @wp.struct
 class Material:
-    type: wp.uint16  # 0: diffuse, 1: specular, 2: light
+    type: wp.uint16  # 0: diffuse, 1: specular
     color: wp.vec3
 
 
@@ -44,7 +47,6 @@ class PathSegment:
     throughput: wp.vec3
     point: wp.vec3  # current hit point
     ray_dir: wp.vec3  # current ray direction
-    normal: wp.vec3  # current hit normal
     pixel_idx: int  # associated pixel index
     finished: wp.bool  # whether the path has finished
     depth: int  # current path depth
@@ -77,33 +79,21 @@ def init_path_segments(
     path_segments[tid].throughput = wp.vec3(1.0, 1.0, 1.0)
     path_segments[tid].point = ro
     path_segments[tid].ray_dir = rd
-    path_segments[tid].normal = wp.vec3(0.0, 1.0, 0.0)
     path_segments[tid].pixel_idx = tid
     path_segments[tid].finished = wp.bool(False)
-
-
-@wp.func
-def hemisphere_sample(
-    normal: wp.vec3,
-) -> wp.vec3:
-    return wp.vec3(0.0, 0.0, 0.0)
-
-
-@wp.func
-def hemisphere_pdf(
-    normal: wp.vec3,
-) -> wp.float32:
-    return 1.0 / (2.0 * wp.pi)
+    path_segments[tid].depth = 0
 
 
 @wp.func
 def shade(
-    wi: wp.vec3,
-    wo: wp.vec3,
-    n: wp.vec3,
+    wi: wp.vec3,  # in normal space
+    wo: wp.vec3,  # in normal space
     mesh: Mesh,
     material: Material,
 ) -> wp.vec3:
+    if material.type == 0:  # diffuse
+        return material.color / wp.pi
+
     return wp.vec3(0.0, 0.0, 0.0)
 
 
@@ -115,6 +105,7 @@ def draw(
     min_t: float,
     max_t: float,
     max_depth: int,
+    iteration: int,
 ):
     tid = wp.tid()
     if path_segments[tid].finished:
@@ -145,31 +136,34 @@ def draw(
             )
             path_segments[tid].finished = wp.bool(True)
             return
-        else:
+
+        state = wp.rand_init(
+            1469598103934665603
+            ^ (tid * 1099511628211)
+            ^ (path_segments[tid].depth * 1469598103934665603)
+            ^ iteration
+        )
+        u1 = wp.randf(state)
+        u2 = wp.randf(state)
+
+        normal_to_world_space = get_coord_system(hit_normal)
+        world_to_normal_space = wp.transpose(normal_to_world_space)
+
+        wi = hemisphere_sample(u1, u2)
+        pdf = hemisphere_pdf(wi)
+
+        if pdf <= 0.0:
+            path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
             path_segments[tid].finished = wp.bool(True)
-            if hit_mesh_idx % 5 == 0:
-                path_segments[tid].throughput = wp.vec3(1.0, 0.0, 0.0)
-            elif hit_mesh_idx % 5 == 1:
-                path_segments[tid].throughput = wp.vec3(0.0, 1.0, 0.0)
-            elif hit_mesh_idx % 5 == 2:
-                path_segments[tid].throughput = wp.vec3(0.0, 0.0, 1.0)
-            elif hit_mesh_idx % 5 == 3:
-                path_segments[tid].throughput = wp.vec3(1.0, 1.0, 0.0)
-            elif hit_mesh_idx % 5 == 4:
-                path_segments[tid].throughput = wp.vec3(1.0, 0.0, 1.0)
             return
 
-        wi = -path_segments[tid].ray_dir
+        wo = world_to_normal_space * -rd
 
-        path_segments[tid].normal = hit_normal
         path_segments[tid].point = hit_point
-        path_segments[tid].ray_dir = hemisphere_sample(hit_normal)
-
-        wo = path_segments[tid].ray_dir
-
-        pdf = hemisphere_pdf(hit_normal)
+        path_segments[tid].ray_dir = normal_to_world_space * wi
         path_segments[tid].throughput = wp.cw_mul(
-            path_segments[tid].throughput, shade(wi, wo, hit_normal, mesh, mat) / pdf
+            path_segments[tid].throughput,
+            shade(wi, wo, mesh, mat) * wi.z / pdf,
         )
         path_segments[tid].depth += 1
         if path_segments[tid].depth >= max_depth:
@@ -202,10 +196,12 @@ class CameraParams:
 
 
 class Renderer:
-    def __init__(self, width=1024, usd_path=None, max_iter=100, max_depth=10):
+    def __init__(
+        self, width: int, usd_path: pathlib.Path, max_iter: int, max_depth: int
+    ):
         self.cam_params = CameraParams()
 
-        asset_stage: Usd.Stage = Usd.Stage.Open(usd_path)
+        asset_stage: Usd.Stage = Usd.Stage.Open(usd_path.as_posix())
 
         self.meshes = []
         self.wp_meshes = []
@@ -324,22 +320,19 @@ class Renderer:
         if self._num_iter >= self.max_iter:
             return
 
-        if self._num_iter == 0:
-            with wp.ScopedTimer("init path segments"):
-                wp.launch(
-                    kernel=init_path_segments,
-                    dim=self.width * self.height,
-                    inputs=[
-                        self._path_segments,
-                        self.width,
-                        self.height,
-                        self.cam_params.pos,
-                        self.cam_params.fov_x,
-                        self.cam_params.fov_y,
-                    ],
-                )
-
         with wp.ScopedTimer("render single iteration"):
+            wp.launch(
+                kernel=init_path_segments,
+                dim=self.width * self.height,
+                inputs=[
+                    self._path_segments,
+                    self.width,
+                    self.height,
+                    self.cam_params.pos,
+                    self.cam_params.fov_x,
+                    self.cam_params.fov_y,
+                ],
+            )
             while True:
                 wp.launch(
                     kernel=draw,
@@ -351,6 +344,7 @@ class Renderer:
                         self.cam_params.clipping_range[0],
                         self.cam_params.clipping_range[1],
                         self.max_depth,
+                        self._num_iter,
                     ],
                 )
                 host_path_segments = self._path_segments.numpy()
@@ -387,8 +381,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--usd-path",
-        type=str,
-        default=os.path.join(os.path.dirname(__file__), "assets", "cornell.usda"),
+        type=pathlib.Path,
+        default=(
+            pathlib.Path(__file__).parent.parent / "assets" / "cornell.usda"
+        ).resolve(),
         help="Path to the USD file to render.",
     )
     parser.add_argument(
@@ -447,8 +443,17 @@ if __name__ == "__main__":
         # main loop
         while g_running:
             renderer.render()
+
+            def tonemap(x):
+                # simple Reinhard operator
+                return x / (1.0 + x)
+
             im.set_data(
-                renderer.pixels.numpy().reshape((renderer.height, renderer.width, 3))
+                tonemap(
+                    renderer.pixels.numpy().reshape(
+                        (renderer.height, renderer.width, 3)
+                    )
+                )
             )
             fig.canvas.draw()
             fig.canvas.flush_events()

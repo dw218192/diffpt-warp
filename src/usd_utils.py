@@ -41,13 +41,17 @@ def usdmesh_to_wpmesh(mesh_geom: UsdGeom.Mesh) -> wp.Mesh:
 
     # triangulate faces
     tri_indices = []
+    orientation = mesh_geom.GetOrientationAttr().Get()
     cursor = 0
     for n in counts:
         face = indices[cursor : cursor + n]
         cursor += n
         # fan triangulation: (v0, v1, v2), (v0, v2, v3), ...
         for i in range(1, n - 1):
-            tri_indices.extend([face[0], face[i], face[i + 1]])
+            if orientation == "leftHanded":
+                tri_indices.extend([face[0], face[i + 1], face[i]])
+            else:
+                tri_indices.extend([face[0], face[i], face[i + 1]])
 
     tri_indices = np.array(tri_indices, dtype=np.int32)
 
