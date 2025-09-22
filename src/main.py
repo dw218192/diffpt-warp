@@ -6,7 +6,6 @@ https://nvidia.github.io/warp/modules/functions.html
 
 from dataclasses import dataclass
 import logging
-import os
 import pathlib
 
 import numpy as np
@@ -21,7 +20,7 @@ from usd_utils import (
     usdmesh_to_wpmesh,
 )
 
-from sampling import hemisphere_sample, hemisphere_pdf, get_coord_system
+from sampling import hemisphere_sample, get_coord_system, rect_sample
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -129,13 +128,14 @@ def draw(
 
     if hit_mesh_idx != -1:
         mesh = meshes[hit_mesh_idx]
-        mat = materials[mesh.material_id]
         if mesh.is_light:
             path_segments[tid].throughput = wp.cw_mul(
                 path_segments[tid].throughput, mesh.light_color * mesh.light_intensity
             )
             path_segments[tid].finished = wp.bool(True)
             return
+
+        mat = materials[mesh.material_id]
 
         state = wp.rand_init(
             1469598103934665603
@@ -149,9 +149,7 @@ def draw(
         normal_to_world_space = get_coord_system(hit_normal)
         world_to_normal_space = wp.transpose(normal_to_world_space)
 
-        wi = hemisphere_sample(u1, u2)
-        pdf = hemisphere_pdf(wi)
-
+        wi, pdf = hemisphere_sample(u1, u2)
         if pdf <= 0.0:
             path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
             path_segments[tid].finished = wp.bool(True)
@@ -166,6 +164,22 @@ def draw(
             shade(wi, wo, mesh, mat) * wi.z / pdf,
         )
         path_segments[tid].depth += 1
+
+        # russain roulette
+        # the brighter the path, the higher the chance of its survival
+        throughput = path_segments[tid].throughput
+        p_rr = wp.min(1.0, wp.max(throughput.x, wp.max(throughput.y, throughput.z)))
+
+        # lower bound
+        p_rr = wp.max(p_rr, 0.22)
+
+        if wp.randf(state) > p_rr:
+            path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
+            path_segments[tid].finished = wp.bool(True)
+        else:
+            path_segments[tid].throughput = throughput / p_rr
+
+        # hard stop
         if path_segments[tid].depth >= max_depth:
             path_segments[tid].finished = wp.bool(True)
     else:
@@ -445,8 +459,8 @@ if __name__ == "__main__":
             renderer.render()
 
             def tonemap(x):
-                # simple Reinhard operator
-                return x / (1.0 + x)
+                y = x / (1.0 + x)
+                return np.power(y, 1 / 2.2)
 
             im.set_data(
                 tonemap(

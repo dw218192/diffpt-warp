@@ -43,19 +43,13 @@ def get_coord_system(normal: wp.vec3):
 # Cosine-weighted hemisphere, Malley’s Method
 # ---------------------------
 @wp.func
-def hemisphere_sample(u1: float, u2: float) -> wp.vec3:
+def hemisphere_sample(u1: float, u2: float) -> tuple[wp.vec3, float]:
     d = concentric_disk_sample(u1, u2)
     x = d[0]
     y = d[1]
     z = wp.sqrt(wp.max(0.0, 1.0 - x * x - y * y))
 
-    return wp.normalize(wp.vec3(x, y, z))
-
-
-@wp.func
-def hemisphere_pdf(dir: wp.vec3) -> float:
-    cos_theta = dir.z
-    return cos_theta / wp.pi if cos_theta > 0.0 else 0.0
+    return wp.normalize(wp.vec3(x, y, z)), z / wp.pi if z > 0.0 else 0.0
 
 
 @wp.kernel
@@ -64,7 +58,13 @@ def visualize_hemisphere(rand_seed: int, dirs: wp.array(dtype=wp.vec3)):
     state = wp.rand_init(rand_seed + tid)
     u1 = wp.randf(state)
     u2 = wp.randf(state)
-    dirs[tid] = hemisphere_sample(u1, u2)
+    dirs[tid], _ = hemisphere_sample(u1, u2)
+
+
+@wp.func
+def rect_sample(u1: float, u2: float, a: float, b: float) -> tuple[wp.vec2, float]:
+    # maps [0,1]^2 -> [0,a] x [0,b]
+    return wp.vec2(a * u1, b * u2), 1.0 / (a * b)
 
 
 # ---------------------------
