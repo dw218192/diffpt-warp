@@ -47,13 +47,13 @@ class PathSegment:
     point: wp.vec3  # current hit point
     ray_dir: wp.vec3  # current ray direction
     pixel_idx: int  # associated pixel index
-    finished: wp.bool  # whether the path has finished
     depth: int  # current path depth
 
 
 @wp.kernel
 def init_path_segments(
     path_segments: wp.array(dtype=PathSegment),
+    path_flags: wp.array(dtype=int),
     width: int,
     height: int,
     # camera
@@ -79,8 +79,9 @@ def init_path_segments(
     path_segments[tid].point = ro
     path_segments[tid].ray_dir = rd
     path_segments[tid].pixel_idx = tid
-    path_segments[tid].finished = wp.bool(False)
     path_segments[tid].depth = 0
+
+    path_flags[tid] = 0
 
 
 @wp.func
@@ -96,9 +97,11 @@ def shade(
     return wp.vec3(0.0, 0.0, 0.0)
 
 
+# path tracing
 @wp.kernel
 def draw(
     path_segments: wp.array(dtype=PathSegment),
+    path_flags: wp.array(dtype=int),
     meshes: wp.array(dtype=Mesh),
     materials: wp.array(dtype=Material),
     min_t: float,
@@ -107,7 +110,7 @@ def draw(
     iteration: int,
 ):
     tid = wp.tid()
-    if path_segments[tid].finished:
+    if path_flags[tid] == 1:
         return
 
     ro = path_segments[tid].point
@@ -132,7 +135,7 @@ def draw(
             path_segments[tid].throughput = wp.cw_mul(
                 path_segments[tid].throughput, mesh.light_color * mesh.light_intensity
             )
-            path_segments[tid].finished = wp.bool(True)
+            path_flags[tid] = 1
             return
 
         mat = materials[mesh.material_id]
@@ -152,7 +155,7 @@ def draw(
         wi, pdf = hemisphere_sample(u1, u2)
         if pdf <= 0.0:
             path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
-            path_segments[tid].finished = wp.bool(True)
+            path_flags[tid] = 1
             return
 
         wo = world_to_normal_space * -rd
@@ -175,18 +178,19 @@ def draw(
 
         if wp.randf(state) > p_rr:
             path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
-            path_segments[tid].finished = wp.bool(True)
+            path_flags[tid] = 1
         else:
             path_segments[tid].throughput = throughput / p_rr
 
         # hard stop
         if path_segments[tid].depth >= max_depth:
-            path_segments[tid].finished = wp.bool(True)
+            path_flags[tid] = 1
     else:
         path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
-        path_segments[tid].finished = wp.bool(True)
+        path_flags[tid] = 1
 
 
+# monte carlo integration
 @wp.kernel
 def accumulate(
     path_segments: wp.array(dtype=PathSegment),
@@ -329,6 +333,7 @@ class Renderer:
         self._path_segments = wp.zeros(
             self.width * self.height, dtype=PathSegment, device="cuda"
         )
+        self._path_flags = wp.zeros(self.width * self.height, dtype=int, device="cuda")
 
     def render(self):
         if self._num_iter >= self.max_iter:
@@ -340,6 +345,7 @@ class Renderer:
                 dim=self.width * self.height,
                 inputs=[
                     self._path_segments,
+                    self._path_flags,
                     self.width,
                     self.height,
                     self.cam_params.pos,
@@ -353,6 +359,7 @@ class Renderer:
                     dim=self.width * self.height,
                     inputs=[
                         self._path_segments,
+                        self._path_flags,
                         self.meshes,
                         self.materials,
                         self.cam_params.clipping_range[0],
@@ -361,10 +368,10 @@ class Renderer:
                         self._num_iter,
                     ],
                 )
-                host_path_segments = self._path_segments.numpy()
+                host_path_flags = self._path_flags.numpy()
                 should_continue = False
                 for i in range(self.width * self.height):
-                    if not host_path_segments[i]["finished"]:
+                    if host_path_flags[i] == 0:
                         should_continue = True
                         break
                 if not should_continue:
