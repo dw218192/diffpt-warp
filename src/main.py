@@ -97,6 +97,31 @@ def shade(
     return wp.vec3(0.0, 0.0, 0.0)
 
 
+@wp.func
+def scene_intersect(
+    ro: wp.vec3,
+    rd: wp.vec3,
+    meshes: wp.array(dtype=Mesh),
+    materials: wp.array(dtype=Material),
+    min_t: float,
+    max_t: float,
+):
+    t = wp.float32(max_t)
+    hit_mesh_idx = wp.int32(-1)
+    hit_normal = wp.vec3(0.0, 0.0, 0.0)
+    hit_point = wp.vec3(0.0, 0.0, 0.0)
+
+    for i in range(meshes.shape[0]):
+        query = wp.mesh_query_ray(meshes[i].mesh_id, ro, rd, max_t)
+        if query.result and query.t < t and query.t > min_t:
+            t = query.t
+            hit_mesh_idx = i
+            hit_normal = query.normal
+            hit_point = ro + t * rd
+
+    return hit_mesh_idx, hit_normal, hit_point
+
+
 # path tracing
 @wp.kernel
 def draw(
@@ -116,18 +141,9 @@ def draw(
     ro = path_segments[tid].point
     rd = path_segments[tid].ray_dir
 
-    t = wp.float32(max_t)
-    hit_mesh_idx = wp.int32(-1)
-    hit_normal = wp.vec3(0.0, 0.0, 0.0)
-    hit_point = wp.vec3(0.0, 0.0, 0.0)
-
-    for i in range(meshes.shape[0]):
-        query = wp.mesh_query_ray(meshes[i].mesh_id, ro, rd, max_t)
-        if query.result and query.t < t and query.t > min_t:
-            t = query.t
-            hit_mesh_idx = i
-            hit_normal = query.normal
-            hit_point = ro + t * rd
+    hit_mesh_idx, hit_normal, hit_point = scene_intersect(
+        ro, rd, meshes, materials, min_t, max_t
+    )
 
     if hit_mesh_idx != -1:
         mesh = meshes[hit_mesh_idx]
@@ -171,10 +187,9 @@ def draw(
         # russain roulette
         # the brighter the path, the higher the chance of its survival
         throughput = path_segments[tid].throughput
-        p_rr = wp.min(1.0, wp.max(throughput.x, wp.max(throughput.y, throughput.z)))
-
-        # lower bound
-        p_rr = wp.max(p_rr, 0.22)
+        p_rr = wp.clamp(
+            wp.max(throughput.x, wp.max(throughput.y, throughput.z)), 0.22, 1.0
+        )
 
         if wp.randf(state) > p_rr:
             path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
@@ -184,6 +199,7 @@ def draw(
 
         # hard stop
         if path_segments[tid].depth >= max_depth:
+            path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
             path_flags[tid] = 1
     else:
         path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
