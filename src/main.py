@@ -1,5 +1,10 @@
 """
-Use Nvidia's warp library to render a simple PBR scene.
+Quick and dirty PBR exercise -- using Nvidia's warp library and Pixar's OpenUSD to implement a simple path tracer.
+Techniques:
+    1. Progressive path tracing
+    2. Multiple importance sampling/ Next Event Estimation using direct light sampling
+    3. Russian Roulette for termination
+    4. Monte Carlo integration
 
 https://nvidia.github.io/warp/modules/functions.html
 """
@@ -20,10 +25,20 @@ from usd_utils import (
     usdmesh_to_wpmesh,
 )
 
-from sampling import hemisphere_sample, get_coord_system, rect_sample
+from warp_math_utils import (
+    hemisphere_sample,
+    hemisphere_pdf,
+    get_coord_system,
+    triangle_sample,
+    power_heuristic,
+    area_to_solid_angle,
+    get_triangle_points,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+EPSILON = 1e-4
 
 
 @wp.struct
@@ -36,6 +51,7 @@ class Material:
 class Mesh:
     mesh_id: wp.uint64  # warp mesh id
     material_id: wp.uint64
+    num_faces: wp.uint32
     is_light: wp.bool
     light_intensity: wp.float32
     light_color: wp.vec3
@@ -43,11 +59,13 @@ class Mesh:
 
 @wp.struct
 class PathSegment:
-    throughput: wp.vec3
+    radiance: wp.vec3  # estimated radiance
+    throughput: wp.vec3  # current throughput of the path
     point: wp.vec3  # current hit point
     ray_dir: wp.vec3  # current ray direction
     pixel_idx: int  # associated pixel index
     depth: int  # current path depth
+    prev_bsdf_pdf: float  # previous BSDF PDF, used by MIS for indirect paths
 
 
 @wp.kernel
@@ -75,19 +93,20 @@ def init_path_segments(
     ro = cam_pos
     rd = wp.normalize(wp.vec3(u, v, -1.0))
 
+    path_segments[tid].radiance = wp.vec3(0.0, 0.0, 0.0)
     path_segments[tid].throughput = wp.vec3(1.0, 1.0, 1.0)
     path_segments[tid].point = ro
     path_segments[tid].ray_dir = rd
     path_segments[tid].pixel_idx = tid
     path_segments[tid].depth = 0
-
+    path_segments[tid].prev_bsdf_pdf = 0.0
     path_flags[tid] = 0
 
 
 @wp.func
 def shade(
     wi: wp.vec3,  # in normal space
-    wo: wp.vec3,  # in normal space
+    wo: wp.vec3,  # in normal space, towards 'sensor'
     mesh: Mesh,
     material: Material,
 ) -> wp.vec3:
@@ -102,24 +121,98 @@ def scene_intersect(
     ro: wp.vec3,
     rd: wp.vec3,
     meshes: wp.array(dtype=Mesh),
-    materials: wp.array(dtype=Material),
     min_t: float,
     max_t: float,
-):
+) -> tuple[int, wp.vec3, wp.vec3, int]:
+    """
+    Find the closest intersection between a ray and the scene geometries (including lights).
+    Returns the index of the hit mesh, the normal at the hit point, the hit point, and the hit face index.
+    If no intersection is found, the hit mesh index is -1.
+    """
     t = wp.float32(max_t)
     hit_mesh_idx = wp.int32(-1)
     hit_normal = wp.vec3(0.0, 0.0, 0.0)
     hit_point = wp.vec3(0.0, 0.0, 0.0)
+    hit_face_idx = wp.int32(-1)
 
     for i in range(meshes.shape[0]):
-        query = wp.mesh_query_ray(meshes[i].mesh_id, ro, rd, max_t)
+        query = wp.mesh_query_ray(meshes[i].mesh_id, ro, rd, t)
         if query.result and query.t < t and query.t > min_t:
             t = query.t
             hit_mesh_idx = i
             hit_normal = query.normal
             hit_point = ro + t * rd
 
-    return hit_mesh_idx, hit_normal, hit_point
+    return hit_mesh_idx, hit_normal, hit_point, hit_face_idx
+
+
+@wp.func
+def light_sample(
+    rand_state: wp.uint32,
+    meshes: wp.array(dtype=Mesh),
+    light_indices: wp.array(dtype=int),
+) -> tuple[int, wp.vec3, wp.vec3, float]:
+    """
+    Sample a random point on the light sources in the scene.
+    Returns the mesh id of the light source, the point on the light source, the normal, and the probability.
+    If there is no light in the scene, returns -1, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0), and 0.0.
+    """
+    num_lights = len(light_indices)
+    if num_lights == 0:
+        return -1, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0), 0.0
+    light_idx = wp.randi(rand_state, 0, num_lights)
+    light_mesh = meshes[light_indices[light_idx]]
+
+    mesh_id = light_mesh.mesh_id
+    num_faces = wp.mesh_get(mesh_id).indices.shape[0] // 3
+    face_idx = wp.randi(rand_state, 0, num_faces)
+
+    normal = wp.mesh_eval_face_normal(mesh_id, face_idx)
+    v1, v2, v3 = get_triangle_points(mesh_id, face_idx)
+    pos, _, pdf = triangle_sample(rand_state, v1, v2, v3)
+
+    # this is not uniform area sampling wrt. all light surfaces
+    # but for simplicity we'll do it this way for now
+    pdf = pdf / float(num_lights * num_faces)
+    return light_indices[light_idx], pos, normal, pdf
+
+
+@wp.func
+def compute_light_pdf(
+    p: wp.vec3,
+    mesh_id: wp.uint64,
+    face_idx: int,
+    meshes: wp.array(dtype=Mesh),
+    light_indices: wp.array(dtype=int),
+) -> float:
+    num_lights = len(light_indices)
+    if num_lights == 0:
+        return 0.0
+    num_faces = wp.mesh_get(mesh_id).indices.shape[0] // 3
+    if num_faces == 0:
+        return 0.0
+
+    v1, v2, v3 = get_triangle_points(mesh_id, face_idx)
+    area = 0.5 * wp.length(wp.cross(v2 - v1, v3 - v1))
+    if area <= 1e-5:
+        return 0.0
+
+    return 1.0 / (area * float(num_lights * num_faces))
+
+
+@wp.func
+def is_visible(
+    target_light_mesh_idx: int, p1: wp.vec3, p2: wp.vec3, meshes: wp.array(dtype=Mesh)
+):
+    """
+    Checks if a ray from p1 to p2 is occluded
+    """
+    p1p2 = p2 - p1
+    max_t = wp.length(p1p2)
+    rd = wp.normalize(p1p2)
+    origin = p1 + rd * EPSILON
+    hit_mesh_idx, _, __, ___ = scene_intersect(origin, rd, meshes, 0.0, max_t + EPSILON)
+    return hit_mesh_idx == target_light_mesh_idx
 
 
 # path tracing
@@ -128,6 +221,7 @@ def draw(
     path_segments: wp.array(dtype=PathSegment),
     path_flags: wp.array(dtype=int),
     meshes: wp.array(dtype=Mesh),
+    light_indices: wp.array(dtype=int),
     materials: wp.array(dtype=Material),
     min_t: float,
     max_t: float,
@@ -138,71 +232,117 @@ def draw(
     if path_flags[tid] == 1:
         return
 
-    ro = path_segments[tid].point
-    rd = path_segments[tid].ray_dir
+    path = path_segments[tid]
+    ro = path.point
+    rd = path.ray_dir
+    rand_state = wp.rand_init(
+        1469598103934665603
+        ^ (tid * 1099511628211)
+        ^ (path.depth * 1469598103934665603)
+        ^ iteration
+    )
 
-    hit_mesh_idx, hit_normal, hit_point = scene_intersect(
-        ro, rd, meshes, materials, min_t, max_t
+    # BSDF sampling
+    hit_mesh_idx, hit_normal, hit_point, hit_face_idx = scene_intersect(
+        ro, rd, meshes, min_t, max_t
     )
 
     if hit_mesh_idx != -1:
-        mesh = meshes[hit_mesh_idx]
-        if mesh.is_light:
-            path_segments[tid].throughput = wp.cw_mul(
-                path_segments[tid].throughput, mesh.light_color * mesh.light_intensity
-            )
-            path_flags[tid] = 1
-            return
-
-        mat = materials[mesh.material_id]
-
-        state = wp.rand_init(
-            1469598103934665603
-            ^ (tid * 1099511628211)
-            ^ (path_segments[tid].depth * 1469598103934665603)
-            ^ iteration
-        )
-        u1 = wp.randf(state)
-        u2 = wp.randf(state)
-
         normal_to_world_space = get_coord_system(hit_normal)
         world_to_normal_space = wp.transpose(normal_to_world_space)
 
-        wi, pdf = hemisphere_sample(u1, u2)
-        if pdf <= 0.0:
-            path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
+        # information about the hit point
+        wo = world_to_normal_space * -rd
+        mesh = meshes[hit_mesh_idx]
+        mat = materials[mesh.material_id]
+
+        # Terminate BSDF path (1 BSDF sample)
+        if mesh.is_light:
+            light_pdf = compute_light_pdf(
+                hit_point, mesh.mesh_id, hit_face_idx, meshes, light_indices
+            )
+            light_pdf_solid_angle = (
+                area_to_solid_angle(ro, hit_point, hit_normal) * light_pdf
+            )
+            mis_weight = power_heuristic(path.prev_bsdf_pdf, light_pdf_solid_angle)
+            path.radiance += mis_weight * wp.cw_mul(
+                path.throughput, mesh.light_color * mesh.light_intensity
+            )
+            path_segments[tid] = path
             path_flags[tid] = 1
             return
 
-        wo = world_to_normal_space * -rd
+        # Light sampling (NEE) (1 Light sample)
+        light_mesh_idx, light_sample_point, light_normal, light_pdf = light_sample(
+            rand_state, meshes, light_indices
+        )
+        light_pdf_solid_angle = (
+            area_to_solid_angle(hit_point, light_sample_point, light_normal) * light_pdf
+        )
 
-        path_segments[tid].point = hit_point
-        path_segments[tid].ray_dir = normal_to_world_space * wi
-        path_segments[tid].throughput = wp.cw_mul(
-            path_segments[tid].throughput,
+        if (
+            light_mesh_idx != -1
+            and light_pdf_solid_angle > 0
+            and is_visible(light_mesh_idx, hit_point, light_sample_point, meshes)
+        ):
+            wi = world_to_normal_space * wp.normalize(light_sample_point - hit_point)
+            if wi.z < 0.0:
+                path.radiance = wp.vec3(0.0, 0.0, 0.0)
+                path_segments[tid] = path
+                path_flags[tid] = 1
+                return
+
+            bsdf_pdf = hemisphere_pdf(wi)
+            mis_weight = power_heuristic(light_pdf_solid_angle, bsdf_pdf)
+            path.radiance += mis_weight * wp.cw_mul(
+                path.throughput,
+                shade(wi, wo, mesh, mat) * wi.z / light_pdf_solid_angle,
+            )
+
+        # BSDF sampling
+        wi = hemisphere_sample(rand_state)
+        pdf = hemisphere_pdf(wi)
+        if pdf <= 0.0 or wi.z < 0.0:
+            path.radiance = wp.vec3(0.0, 0.0, 0.0)
+            path_segments[tid] = path
+            path_flags[tid] = 1
+            return
+
+        path.point = hit_point + hit_normal * EPSILON
+        path.ray_dir = normal_to_world_space * wi
+        path.throughput = wp.cw_mul(
+            path.throughput,
             shade(wi, wo, mesh, mat) * wi.z / pdf,
         )
-        path_segments[tid].depth += 1
+        path.depth += 1
 
         # russain roulette
         # the brighter the path, the higher the chance of its survival
-        throughput = path_segments[tid].throughput
+        throughput = path.throughput
         p_rr = wp.clamp(
             wp.max(throughput.x, wp.max(throughput.y, throughput.z)), 0.22, 1.0
         )
 
-        if wp.randf(state) > p_rr:
-            path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
+        if wp.randf(rand_state) > p_rr:
+            path.radiance = wp.vec3(0.0, 0.0, 0.0)
+            path_segments[tid] = path
             path_flags[tid] = 1
-        else:
-            path_segments[tid].throughput = throughput / p_rr
+            return
 
+        path.throughput = throughput / p_rr
         # hard stop
-        if path_segments[tid].depth >= max_depth:
-            path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
+        if path.depth >= max_depth:
+            path.radiance = wp.vec3(0.0, 0.0, 0.0)
+            path_segments[tid] = path
             path_flags[tid] = 1
+            return
+
+        # cache the BSDF PDF
+        path.prev_bsdf_pdf = pdf
+        path_segments[tid] = path
     else:
-        path_segments[tid].throughput = wp.vec3(0.0, 0.0, 0.0)
+        path.radiance = wp.vec3(0.0, 0.0, 0.0)
+        path_segments[tid] = path
         path_flags[tid] = 1
 
 
@@ -216,7 +356,7 @@ def accumulate(
     tid = wp.tid()
     num_samples = iteration + 1
     pixel_idx = path_segments[tid].pixel_idx
-    pixels[pixel_idx] += (path_segments[tid].throughput - pixels[pixel_idx]) / float(
+    pixels[pixel_idx] += (path_segments[tid].radiance - pixels[pixel_idx]) / float(
         num_samples
     )
 
@@ -239,7 +379,7 @@ class Renderer:
 
         self.meshes = []
         self.wp_meshes = []
-
+        self.light_indices = []
         self.materials = []
         mat_prim_path_to_mat_id = {}
 
@@ -252,10 +392,8 @@ class Renderer:
                 material.type = 0
             elif type == "specular":
                 material.type = 1
-            elif type == "light":
-                material.type = 2
             else:
-                raise ValueError(f"Unknown material type: {type}")
+                raise ValueError(f"Unsupported material type: {type}")
 
             material.color = color
             return material
@@ -279,17 +417,24 @@ class Renderer:
 
             return mesh
 
+        # collect all materials
         for prim in asset_stage.Traverse():
             if prim.IsA(UsdShade.Material):
                 material = create_material(prim)
                 self.materials.append(material)
                 mat_prim_path_to_mat_id[prim.GetPrimPath()] = len(self.materials) - 1
 
+        # create rendering primitives
         for prim in asset_stage.Traverse():
             if prim.IsA(UsdGeom.Mesh):
                 mesh_geom = UsdGeom.Mesh(prim)
                 self.wp_meshes.append(usdmesh_to_wpmesh(mesh_geom))
-                self.meshes.append(create_mesh(self.wp_meshes[-1], prim, False))
+
+                if prim.HasAPI(UsdLux.MeshLightAPI):
+                    self.meshes.append(create_mesh(self.wp_meshes[-1], prim, True))
+                    self.light_indices.append(len(self.meshes) - 1)
+                else:
+                    self.meshes.append(create_mesh(self.wp_meshes[-1], prim, False))
 
             elif prim.IsA(UsdLux.RectLight):
                 rect_light = UsdLux.RectLight(prim)
@@ -312,6 +457,7 @@ class Renderer:
                     )
                 )
                 self.meshes.append(create_mesh(self.wp_meshes[-1], prim, True))
+                self.light_indices.append(len(self.meshes) - 1)
 
             elif prim.IsA(UsdGeom.Camera):
                 usd_cam = UsdGeom.Camera(prim)
@@ -342,6 +488,7 @@ class Renderer:
         self.pixels = wp.zeros(self.width * self.height, dtype=wp.vec3)
         self.meshes = wp.array(self.meshes, dtype=Mesh)
         self.materials = wp.array(self.materials, dtype=Material)
+        self.light_indices = wp.array(self.light_indices, dtype=int)
         self.max_iter = max_iter
         self.max_depth = max_depth
 
@@ -377,6 +524,7 @@ class Renderer:
                         self._path_segments,
                         self._path_flags,
                         self.meshes,
+                        self.light_indices,
                         self.materials,
                         self.cam_params.clipping_range[0],
                         self.cam_params.clipping_range[1],
