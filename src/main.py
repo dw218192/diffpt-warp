@@ -18,6 +18,8 @@ from pxr import Usd, UsdGeom, UsdLux, UsdShade
 
 import warp as wp
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.widgets import TextBox
 
 from usd_utils import (
     extract_pos,
@@ -34,6 +36,7 @@ from warp_math_utils import (
     area_to_solid_angle,
     get_triangle_points,
 )
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +69,7 @@ class PathSegment:
     pixel_idx: int  # associated pixel index
     depth: int  # current path depth
     prev_bsdf_pdf: float  # previous BSDF PDF, used by MIS for indirect paths
+    debug_radiance: wp.vec3  # n-bounce radiance storage for debugging purposes
 
 
 @wp.kernel
@@ -126,7 +130,7 @@ def scene_intersect(
 ) -> tuple[int, wp.vec3, wp.vec3, int]:
     """
     Find the closest intersection between a ray and the scene geometries (including lights).
-    Returns the index of the hit mesh, the normal at the hit point, the hit point, and the hit face index.
+    Returns the index (not warp mesh id) of the hit mesh, the normal at the hit point, the hit point, and the hit face index.
     If no intersection is found, the hit mesh index is -1.
     """
     t = wp.float32(max_t)
@@ -154,12 +158,13 @@ def light_sample(
 ) -> tuple[int, wp.vec3, wp.vec3, float]:
     """
     Sample a random point on the light sources in the scene.
-    Returns the mesh id of the light source, the point on the light source, the normal, and the probability.
-    If there is no light in the scene, returns -1, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0), and 0.0.
+    Returns the mesh index (not warp mesh id) of the light source, the point on the light source, the normal, and the probability.
+    If there is no light in the scene, the mesh index is -1.
     """
     num_lights = len(light_indices)
     if num_lights == 0:
         return -1, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0), 0.0
+
     light_idx = wp.randi(rand_state, 0, num_lights)
     light_mesh = meshes[light_indices[light_idx]]
 
@@ -185,6 +190,9 @@ def compute_light_pdf(
     meshes: wp.array(dtype=Mesh),
     light_indices: wp.array(dtype=int),
 ) -> float:
+    """
+    Given a point on a light source, compute the PDF of sampling that point.
+    """
     num_lights = len(light_indices)
     if num_lights == 0:
         return 0.0
@@ -215,7 +223,6 @@ def is_visible(
     return hit_mesh_idx == target_light_mesh_idx
 
 
-# path tracing
 @wp.kernel
 def draw(
     path_segments: wp.array(dtype=PathSegment),
@@ -227,6 +234,7 @@ def draw(
     max_t: float,
     max_depth: int,
     iteration: int,
+    debug_radiance_depth: int,  # -1: no debug, 0: first bounce (direct), 1: second bounce (1-bounce lighting), etc.
 ):
     tid = wp.tid()
     if path_flags[tid] == 1:
@@ -265,9 +273,14 @@ def draw(
                 area_to_solid_angle(ro, hit_point, hit_normal) * light_pdf
             )
             mis_weight = power_heuristic(path.prev_bsdf_pdf, light_pdf_solid_angle)
-            path.radiance += mis_weight * wp.cw_mul(
+            contrib = wp.cw_mul(
                 path.throughput, mesh.light_color * mesh.light_intensity
             )
+            path.radiance += mis_weight * contrib
+
+            if path.depth == debug_radiance_depth:
+                path.debug_radiance += mis_weight * contrib
+
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -294,16 +307,21 @@ def draw(
 
             bsdf_pdf = hemisphere_pdf(wi)
             mis_weight = power_heuristic(light_pdf_solid_angle, bsdf_pdf)
-            path.radiance += mis_weight * wp.cw_mul(
+            contrib = wp.cw_mul(
                 path.throughput,
                 shade(wi, wo, mesh, mat) * wi.z / light_pdf_solid_angle,
             )
+            path.radiance += mis_weight * contrib
+
+            if path.depth == debug_radiance_depth - 1:
+                path.debug_radiance += mis_weight * contrib
 
         # BSDF sampling
         wi = hemisphere_sample(rand_state)
         pdf = hemisphere_pdf(wi)
         if pdf <= 0.0 or wi.z < 0.0:
             path.radiance = wp.vec3(0.0, 0.0, 0.0)
+            path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -325,6 +343,7 @@ def draw(
 
         if wp.randf(rand_state) > p_rr:
             path.radiance = wp.vec3(0.0, 0.0, 0.0)
+            path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -333,6 +352,7 @@ def draw(
         # hard stop
         if path.depth >= max_depth:
             path.radiance = wp.vec3(0.0, 0.0, 0.0)
+            path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -342,6 +362,7 @@ def draw(
         path_segments[tid] = path
     else:
         path.radiance = wp.vec3(0.0, 0.0, 0.0)
+        path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
         path_segments[tid] = path
         path_flags[tid] = 1
 
@@ -350,15 +371,38 @@ def draw(
 @wp.kernel
 def accumulate(
     path_segments: wp.array(dtype=PathSegment),
-    pixels: wp.array(dtype=wp.vec3),
+    radiances: wp.array(dtype=wp.vec3),
+    debug_radiances: wp.array(dtype=wp.vec3),
     iteration: int,
 ):
     tid = wp.tid()
     num_samples = iteration + 1
     pixel_idx = path_segments[tid].pixel_idx
-    pixels[pixel_idx] += (path_segments[tid].radiance - pixels[pixel_idx]) / float(
-        num_samples
-    )
+    radiances[pixel_idx] += (
+        path_segments[tid].radiance - radiances[pixel_idx]
+    ) / float(num_samples)
+    debug_radiances[pixel_idx] += (
+        path_segments[tid].debug_radiance - debug_radiances[pixel_idx]
+    ) / float(num_samples)
+
+
+@wp.kernel
+def tonemap(
+    radiances: wp.array(dtype=wp.vec3),
+    pixels: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    pixel = radiances[tid]
+    pixel[0] /= 1.0 + pixel[0]
+    pixel[1] /= 1.0 + pixel[1]
+    pixel[2] /= 1.0 + pixel[2]
+
+    # gamma correction
+    p = 0.45454545454  # 1/2.2
+    pixel[0] = wp.clamp(wp.pow(pixel[0], p), 0.0, 1.0)
+    pixel[1] = wp.clamp(wp.pow(pixel[1], p), 0.0, 1.0)
+    pixel[2] = wp.clamp(wp.pow(pixel[2], p), 0.0, 1.0)
+    pixels[tid] = pixel
 
 
 @dataclass
@@ -485,18 +529,33 @@ class Renderer:
         logger.info(f"Using Camera Params: {self.cam_params}")
         logger.info(f"Loaded {len(self.meshes)} meshes")
 
-        self.pixels = wp.zeros(self.width * self.height, dtype=wp.vec3)
+        # stores the running estimates of the radiances for each pixel
+        self.radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
+        # stores the running estimates of debug radiances (n-th term of the Neumann series representation of the rendering equation)
+        self.debug_radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
+
         self.meshes = wp.array(self.meshes, dtype=Mesh)
         self.materials = wp.array(self.materials, dtype=Material)
         self.light_indices = wp.array(self.light_indices, dtype=int)
         self.max_iter = max_iter
         self.max_depth = max_depth
 
+        self._debug_radiance_depth = -1
+        self._last_debug_radiance_depth = -1
+
         self._num_iter = 0
         self._path_segments = wp.zeros(
             self.width * self.height, dtype=PathSegment, device="cuda"
         )
         self._path_flags = wp.zeros(self.width * self.height, dtype=int, device="cuda")
+
+    @property
+    def debug_radiance_depth(self):
+        return self._debug_radiance_depth
+
+    @debug_radiance_depth.setter
+    def debug_radiance_depth(self, value: int):
+        self._debug_radiance_depth = value
 
     def render(self):
         if self._num_iter >= self.max_iter:
@@ -530,6 +589,7 @@ class Renderer:
                         self.cam_params.clipping_range[1],
                         self.max_depth,
                         self._num_iter,
+                        self._debug_radiance_depth,
                     ],
                 )
                 host_path_flags = self._path_flags.numpy()
@@ -541,12 +601,17 @@ class Renderer:
                 if not should_continue:
                     break
 
+            if self._last_debug_radiance_depth != self._debug_radiance_depth:
+                self.debug_radiances.zero_()
+                self._last_debug_radiance_depth = self._debug_radiance_depth
+
             wp.launch(
                 kernel=accumulate,
                 dim=self.width * self.height,
                 inputs=[
                     self._path_segments,
-                    self.pixels,
+                    self.radiances,
+                    self.debug_radiances,
                     self._num_iter,
                 ],
             )
@@ -554,6 +619,10 @@ class Renderer:
 
     def reset(self):
         self._num_iter = 0
+        self._last_debug_radiance_depth = -1
+        self._debug_radiance_depth = -1
+        self.radiances.zero_()
+        self.debug_radiances.zero_()
 
 
 g_running = True
@@ -595,11 +664,48 @@ if __name__ == "__main__":
 
         plt.ion()  # turn on interactive mode
         fig, ax = plt.subplots()
+        gs = gridspec.GridSpec(
+            1, 2, width_ratios=[2, 1], height_ratios=[1], figure=fig, wspace=0.05
+        )
+
+        ax = fig.add_subplot(gs[:, 0])  # big render view
+        ax_direct_lights = fig.add_subplot(gs[0, 1])
+
         ax.set_title("PBR Renderer")
         ax.set_axis_off()
 
+        ax_direct_lights.set_title("N-bounce Radiance")
+        ax_direct_lights.set_axis_off()
+
+        # --- Add TextBox widget at bottom of the figure ---
+        axbox = fig.add_axes([0.5, 0.02, 0.2, 0.05])  # [left, bottom, width, height]
+        textbox = TextBox(axbox, "Debug Radiance Depth: ", initial="-1")
+
+        def on_submit(text):
+            try:
+                val = int(text)
+                val = max(-1, min(val, renderer.max_depth))
+                ax_direct_lights.set_title(f"{val} Bounce Radiance")
+
+                logger.info(f"Setting debug radiance depth to {val}")
+                renderer.debug_radiance_depth = val
+            except ValueError:
+                textbox.set_val(renderer.debug_radiance_depth)
+                logger.error(f"'{text}' is not a valid integer!")
+
+        textbox.on_submit(on_submit)
+
+        # pixel buffer for display on the screen
+        dev_pixels = wp.zeros(renderer.width * renderer.height, dtype=wp.vec3)
+
         im = ax.imshow(
-            renderer.pixels.numpy().reshape((renderer.height, renderer.width, 3)),
+            dev_pixels.numpy().reshape((renderer.height, renderer.width, 3)),
+            origin="lower",
+            interpolation="antialiased",
+            aspect="equal",
+        )
+        im_direct_lights = ax_direct_lights.imshow(
+            dev_pixels.numpy().reshape((renderer.height, renderer.width, 3)),
             origin="lower",
             interpolation="antialiased",
             aspect="equal",
@@ -628,17 +734,27 @@ if __name__ == "__main__":
         # main loop
         while g_running:
             renderer.render()
-
-            def tonemap(x):
-                y = x / (1.0 + x)
-                return np.power(y, 1 / 2.2)
-
+            wp.launch(
+                kernel=tonemap,
+                dim=renderer.width * renderer.height,
+                inputs=[
+                    renderer.radiances,
+                    dev_pixels,
+                ],
+            )
             im.set_data(
-                tonemap(
-                    renderer.pixels.numpy().reshape(
-                        (renderer.height, renderer.width, 3)
-                    )
-                )
+                dev_pixels.numpy().reshape((renderer.height, renderer.width, 3))
+            )
+            wp.launch(
+                kernel=tonemap,
+                dim=renderer.width * renderer.height,
+                inputs=[
+                    renderer.debug_radiances,
+                    dev_pixels,
+                ],
+            )
+            im_direct_lights.set_data(
+                dev_pixels.numpy().reshape((renderer.height, renderer.width, 3))
             )
             fig.canvas.draw()
             fig.canvas.flush_events()
