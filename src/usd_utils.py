@@ -1,7 +1,10 @@
 import typing
 from pxr import Gf, Usd, UsdGeom
 import numpy as np
-import warp as wp
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def decompose_world_transform(
@@ -32,10 +35,14 @@ def get_world_transform(prim: Usd.Prim) -> Gf.Matrix4d:
     return xform.ComputeLocalToWorldTransform(time)
 
 
-def usdmesh_to_wpmesh(mesh_geom: UsdGeom.Mesh) -> wp.Mesh:
+def get_mesh_points_and_indices(
+    mesh_geom: UsdGeom.Mesh,
+) -> tuple[np.ndarray, np.ndarray]:
     transform = get_world_transform(mesh_geom.GetPrim())
     points = mesh_geom.GetPointsAttr().Get()
     points = np.array([transform.TransformAffine(p) for p in points], dtype=np.float32)
+    assert points.shape[1] == 3
+
     counts = np.array(mesh_geom.GetFaceVertexCountsAttr().Get(), dtype=np.int32)
     indices = np.array(mesh_geom.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
 
@@ -55,8 +62,27 @@ def usdmesh_to_wpmesh(mesh_geom: UsdGeom.Mesh) -> wp.Mesh:
 
     tri_indices = np.array(tri_indices, dtype=np.int32)
 
-    return wp.Mesh(
-        points=wp.array(points, dtype=wp.vec3),
-        velocities=None,
-        indices=wp.array(tri_indices, dtype=int),
-    )
+    return points, tri_indices
+
+
+def compute_mesh_surface_area(
+    points: np.ndarray[np.float32], indices: np.ndarray[np.int32]
+) -> float:
+    if len(points) == 0 or len(indices) == 0:
+        logger.warning("Points or indices are empty")
+        return 0.0
+    elif len(indices) % 3 != 0:
+        logger.warning("Num of indices is not a multiple of 3: %d", len(indices))
+        return 0.0
+
+    num_faces = indices.shape[0] // 3
+    surface_area = 0.0
+    for i in range(num_faces):
+        i1 = indices[3 * i]
+        i2 = indices[3 * i + 1]
+        i3 = indices[3 * i + 2]
+        v1 = points[i1]
+        v2 = points[i2]
+        v3 = points[i3]
+        surface_area += 0.5 * np.linalg.norm(np.cross(v2 - v1, v3 - v1))
+    return surface_area

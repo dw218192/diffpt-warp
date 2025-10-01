@@ -16,6 +16,10 @@ def get_triangle_points(
     v1 = wp.mesh_get_point(mesh_id, i1)
     v2 = wp.mesh_get_point(mesh_id, i2)
     v3 = wp.mesh_get_point(mesh_id, i3)
+
+    area = 0.5 * wp.length(wp.cross(v2 - v1, v3 - v1))
+    # if area <= 1e-5:
+    #     wp.printf("area: %f\n", area)
     return v1, v2, v3
 
 
@@ -26,6 +30,16 @@ def get_triangle_points(
 def power_heuristic(p1: float, p2: float):
     psum = p1 + p2
     return p1 * p1 / (psum * psum)
+
+
+@wp.func
+def solid_angle_to_area(p1: wp.vec3, p2: wp.vec3, n2: wp.vec3):
+    """
+    Computes dΩ/dA: the area on the surface (at p2 with normal n2)
+    that corresponds to one unit solid angle as seen from p1.
+    """
+    p2p1 = p1 - p2
+    return wp.abs(wp.dot(wp.normalize(p2p1), n2)) / wp.dot(p2p1, p2p1)
 
 
 @wp.func
