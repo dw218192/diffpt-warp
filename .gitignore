@@ -6,3 +6,7 @@ uv.toml
 
 # local stuff
 _local
+_*
+
+# kit authoring
+.thumbs

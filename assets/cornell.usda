@@ -7,8 +7,8 @@
                 double radius = 500
             }
             dictionary Perspective = {
-                double3 position = (0.15605422399172308, 6.911244694300699, 11.387020422116768)
-                double3 target = (-0.6429595673169111, 5.407341658925003, 4.379558331494848)
+                double3 position = (-0.379111987975656, 8.528238922072736, 19.343609794031362)
+                double3 target = (0.4365935695744985, 2.088239391218056, 1.8114031088035816)
             }
             dictionary Right = {
                 double3 position = (-500, 0, 0)
@@ -36,49 +36,21 @@ def Xform "geo" (
     kind = "group"
 )
 {
-    def Xform "floor" (
-        kind = "component"
-    )
-    {
-        matrix4d xformOp:transform:transform3 = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
-        uniform token[] xformOpOrder = ["xformOp:transform:transform3"]
-
-        def Mesh "mesh_0" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
-        )
-        {
-            float3[] extent = [(-5, 0, -5), (5, 0, 5)]
-            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4]
-            int[] faceVertexIndices = [0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 4, 5, 9, 8, 5, 6, 10, 9, 6, 7, 11, 10, 8, 9, 13, 12, 9, 10, 14, 13, 10, 11, 15, 14]
-            rel material:binding = </materials/diffuse_white>
-            uniform token orientation = "leftHanded"
-            point3f[] points = [(-5, 0, -5), (-1.6666667, 0, -5), (1.6666665, 0, -5), (5, 0, -5), (-5, 0, -1.6666667), (-1.6666667, 0, -1.6666667), (1.6666665, 0, -1.6666667), (5, 0, -1.6666667), (-5, 0, 1.6666665), (-1.6666667, 0, 1.6666665), (1.6666665, 0, 1.6666665), (5, 0, 1.6666665), (-5, 0, 5), (-1.6666667, 0, 5), (1.6666665, 0, 5), (5, 0, 5)] (
-                interpolation = "vertex"
-            )
-            uniform token subdivisionScheme = "none"
-        }
-    }
-
     def Xform "left" (
         kind = "component"
     )
     {
-        matrix4d xformOp:transform:transform1 = ( (0, -1, 0, 0), (1, 0, 0, 0), (0, 0, 1, 0), (-5, 5, 0, 1) )
-        uniform token[] xformOpOrder = ["xformOp:transform:transform1"]
+        double3 xformOp:rotateXYZ = (0, 90, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (-5, 5, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
-        def Mesh "mesh_0" (
+        def "quad" (
             prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend payload = @./quad.usda@
         )
         {
-            float3[] extent = [(-5, 0, -5), (5, 0, 5)]
-            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4]
-            int[] faceVertexIndices = [0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 4, 5, 9, 8, 5, 6, 10, 9, 6, 7, 11, 10, 8, 9, 13, 12, 9, 10, 14, 13, 10, 11, 15, 14]
             rel material:binding = </materials/diffuse_red>
-            uniform token orientation = "leftHanded"
-            point3f[] points = [(-5, 0, -5), (-1.6666667, 0, -5), (1.6666665, 0, -5), (5, 0, -5), (-5, 0, -1.6666667), (-1.6666667, 0, -1.6666667), (1.6666665, 0, -1.6666667), (5, 0, -1.6666667), (-5, 0, 1.6666665), (-1.6666667, 0, 1.6666665), (1.6666665, 0, 1.6666665), (5, 0, 1.6666665), (-5, 0, 5), (-1.6666667, 0, 5), (1.6666665, 0, 5), (5, 0, 5)] (
-                interpolation = "vertex"
-            )
-            uniform token subdivisionScheme = "none"
         }
     }
 
@@ -86,22 +58,35 @@ def Xform "geo" (
         kind = "component"
     )
     {
-        matrix4d xformOp:transform:transform2 = ( (0, 1, 0, 0), (-1, 0, 0, 0), (0, 0, 1, 0), (5, 5, 0, 1) )
-        uniform token[] xformOpOrder = ["xformOp:transform:transform2"]
+        double3 xformOp:rotateXYZ = (0, -90, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (5, 5, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
-        def Mesh "mesh_0" (
+        def "quad" (
             prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend payload = @./quad.usda@
         )
         {
-            float3[] extent = [(-5, 0, -5), (5, 0, 5)]
-            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4]
-            int[] faceVertexIndices = [0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 4, 5, 9, 8, 5, 6, 10, 9, 6, 7, 11, 10, 8, 9, 13, 12, 9, 10, 14, 13, 10, 11, 15, 14]
             rel material:binding = </materials/diffuse_green>
-            uniform token orientation = "leftHanded"
-            point3f[] points = [(-5, 0, -5), (-1.6666667, 0, -5), (1.6666665, 0, -5), (5, 0, -5), (-5, 0, -1.6666667), (-1.6666667, 0, -1.6666667), (1.6666665, 0, -1.6666667), (5, 0, -1.6666667), (-5, 0, 1.6666665), (-1.6666667, 0, 1.6666665), (1.6666665, 0, 1.6666665), (5, 0, 1.6666665), (-5, 0, 5), (-1.6666667, 0, 5), (1.6666665, 0, 5), (5, 0, 5)] (
-                interpolation = "vertex"
-            )
-            uniform token subdivisionScheme = "none"
+        }
+    }
+
+    def Xform "floor" (
+        kind = "component"
+    )
+    {
+        double3 xformOp:rotateXYZ = (-90, 0, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+
+        def "quad" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend payload = @./quad.usda@
+        )
+        {
+            rel material:binding = </materials/diffuse_white>
         }
     }
 
@@ -109,22 +94,17 @@ def Xform "geo" (
         kind = "component"
     )
     {
-        matrix4d xformOp:transform:transform4 = ( (1, 0, 0, 0), (0, -1, 0, 0), (0, 0, -1, 0), (0, 10, 0, 1) )
-        uniform token[] xformOpOrder = ["xformOp:transform:transform4"]
+        double3 xformOp:rotateXYZ = (90, 0, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (0, 10, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
-        def Mesh "mesh_0" (
+        def "quad" (
             prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend payload = @./quad.usda@
         )
         {
-            float3[] extent = [(-5, 0, -5), (5, 0, 5)]
-            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4]
-            int[] faceVertexIndices = [0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 4, 5, 9, 8, 5, 6, 10, 9, 6, 7, 11, 10, 8, 9, 13, 12, 9, 10, 14, 13, 10, 11, 15, 14]
             rel material:binding = </materials/diffuse_white>
-            uniform token orientation = "leftHanded"
-            point3f[] points = [(-5, 0, -5), (-1.6666667, 0, -5), (1.6666665, 0, -5), (5, 0, -5), (-5, 0, -1.6666667), (-1.6666667, 0, -1.6666667), (1.6666665, 0, -1.6666667), (5, 0, -1.6666667), (-5, 0, 1.6666665), (-1.6666667, 0, 1.6666665), (1.6666665, 0, 1.6666665), (5, 0, 1.6666665), (-5, 0, 5), (-1.6666667, 0, 5), (1.6666665, 0, 5), (5, 0, 5)] (
-                interpolation = "vertex"
-            )
-            uniform token subdivisionScheme = "none"
         }
     }
 
@@ -132,22 +112,17 @@ def Xform "geo" (
         kind = "component"
     )
     {
-        matrix4d xformOp:transform:transform5 = ( (1, 0, 0, 0), (0, 0, 1, 0), (0, -1, 0, 0), (0, 5, -5, 1) )
-        uniform token[] xformOpOrder = ["xformOp:transform:transform5"]
+        double3 xformOp:rotateXYZ = (0, 0, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (0, 5, -5)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
-        def Mesh "mesh_0" (
+        def "quad" (
             prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend payload = @./quad.usda@
         )
         {
-            float3[] extent = [(-5, 0, -5), (5, 0, 5)]
-            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4]
-            int[] faceVertexIndices = [0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 4, 5, 9, 8, 5, 6, 10, 9, 6, 7, 11, 10, 8, 9, 13, 12, 9, 10, 14, 13, 10, 11, 15, 14]
             rel material:binding = </materials/diffuse_white>
-            uniform token orientation = "leftHanded"
-            point3f[] points = [(-5, 0, -5), (-1.6666667, 0, -5), (1.6666665, 0, -5), (5, 0, -5), (-5, 0, -1.6666667), (-1.6666667, 0, -1.6666667), (1.6666665, 0, -1.6666667), (5, 0, -1.6666667), (-5, 0, 1.6666665), (-1.6666667, 0, 1.6666665), (1.6666665, 0, 1.6666665), (5, 0, 1.6666665), (-5, 0, 5), (-1.6666667, 0, 5), (1.6666665, 0, 5), (5, 0, 5)] (
-                interpolation = "vertex"
-            )
-            uniform token subdivisionScheme = "none"
         }
     }
 
@@ -155,22 +130,22 @@ def Xform "geo" (
         kind = "component"
     )
     {
-        matrix4d xformOp:transform:transform6 = ( (0.9492230699718083, 0, 0.3146038198008658, 0), (0, 1, 0, 0), (-0.3146038198008658, 0, 0.9492230699718083, 0), (2.4168470505458743, -0.0452211395831854, -0.8744938154342172, 1) )
-        uniform token[] xformOpOrder = ["xformOp:transform:transform6"]
+        double3 xformOp:rotateXYZ = (0, 30, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        double3 xformOp:translate = (-2.3319842075802537, 0.9999999999999307, 0.9429324389820959)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
-        def Mesh "mesh_0" (
+        def "cube" (
             prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend payload = @./cube.usda@
         )
         {
-            float3[] extent = [(-1.1902515, 0.016199112, -1.0826181), (1.4202199, 5.226319, 2.2121406)]
-            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
-            int[] faceVertexIndices = [0, 1, 3, 2, 4, 5, 7, 6, 6, 7, 2, 3, 5, 4, 1, 0, 5, 0, 2, 7, 1, 4, 6, 3]
+            quatf xformOp:orient = (1, 0, 0, 0)
+            float3 xformOp:scale = (1, 1, 1)
+            double3 xformOp:translate = (0.7005032709425458, -2.6645352591003757e-15, -0.5917343177436554)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
             rel material:binding = </materials/diffuse_white>
-            uniform token orientation = "leftHanded"
-            point3f[] points = [(1.4202199, 0.016199112, 2.2121406), (-1.1902515, 0.016199112, 2.2121406), (1.4202199, 5.226319, 2.2121406), (-1.1902515, 5.226319, 2.2121406), (-1.1902515, 0.016199112, -1.0826181), (1.4202199, 0.016199112, -1.0826181), (-1.1902515, 5.226319, -1.0826181), (1.4202199, 5.226319, -1.0826181)] (
-                interpolation = "vertex"
-            )
-            uniform token subdivisionScheme = "none"
         }
     }
 
@@ -178,26 +153,19 @@ def Xform "geo" (
         kind = "component"
     )
     {
-        matrix4d xformOp:transform:transform7 = ( (0.9725301064024782, 0, -0.2327771297631805, 0), (0, 1, 0, 0), (0.2327771297631805, 0, 0.9725301064024782, 0), (-1.740389658313308, -0.04965573756355046, 0.8239324989220087, 1) )
-        uniform token[] xformOpOrder = ["xformOp:transform:transform7"]
+        double3 xformOp:rotateXYZ = (0, -30, 0)
+        double3 xformOp:scale = (1, 2, 1)
+        double3 xformOp:translate = (2.0797298443455805, 2, 0.9429324389820959)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
-        def Mesh "mesh_0" (
+        def "cube" (
             prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend payload = @./cube.usda@
         )
         {
-            float3[] extent = [(-1.1902515, 0.016199112, -1.0826181), (1.0734975, 2.1911936, 1.2492943)]
-            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
-            int[] faceVertexIndices = [0, 1, 3, 2, 4, 5, 7, 6, 6, 7, 2, 3, 5, 4, 1, 0, 5, 0, 2, 7, 1, 4, 6, 3]
             rel material:binding = </materials/diffuse_white>
-            uniform token orientation = "leftHanded"
-            point3f[] points = [(1.0734975, 0.016199112, 1.2492943), (-1.1902515, 0.016199112, 1.2492943), (1.0734975, 2.1911936, 1.2492943), (-1.1902515, 2.1911936, 1.2492943), (-1.1902515, 0.016199112, -1.0826181), (1.0734975, 0.016199112, -1.0826181), (-1.1902515, 2.1911936, -1.0826181), (1.0734975, 2.1911936, -1.0826181)] (
-                interpolation = "vertex"
-            )
-            uniform token subdivisionScheme = "none"
         }
     }
-
-
 }
 
 def Xform "materials" (
