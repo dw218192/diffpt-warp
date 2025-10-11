@@ -337,11 +337,6 @@ def draw(
                 path_flags[tid] = 1
                 return
 
-        path.radiance = wp.vec3(0.0, 0.0, 0.0)
-        path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
-        path_segments[tid] = path
-        path_flags[tid] = 1
-
         # BSDF sampling
         wi = hemisphere_sample(rand_state)
         pdf = hemisphere_pdf(wi)
