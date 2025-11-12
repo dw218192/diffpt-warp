@@ -7,8 +7,8 @@
                 double radius = 500
             }
             dictionary Perspective = {
-                double3 position = (-0.379111987975656, 8.528238922072736, 19.343609794031362)
-                double3 target = (0.4365935695744985, 2.088239391218056, 1.8114031088035816)
+                double3 position = (0.18654607260285921, 5.477318124824527, 5.570777200423979)
+                double3 target = (-0.2057545086571544, 1.9309071037674994, 2.97250425668099)
             }
             dictionary Right = {
                 double3 position = (-500, 0, 0)
@@ -19,6 +19,11 @@
                 double radius = 500
             }
             string boundCamera = "/OmniverseKit_Persp"
+        }
+        dictionary metricsAssembler = {
+            dictionary "/geo/sphere" = {
+            }
+            int version = 1
         }
         dictionary renderSettings = {
             double "rtx:post:chromaticAberration:strengthB" = -0.054999999701976776
@@ -140,12 +145,11 @@ def Xform "geo" (
             prepend payload = @./cube.usda@
         )
         {
+            rel material:binding = </materials/diffuse_white>
             quatf xformOp:orient = (1, 0, 0, 0)
             float3 xformOp:scale = (1, 1, 1)
             double3 xformOp:translate = (0.7005032709425458, -2.6645352591003757e-15, -0.5917343177436554)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
-
-            rel material:binding = </materials/diffuse_white>
         }
     }
 
@@ -161,6 +165,29 @@ def Xform "geo" (
         def "cube" (
             prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./cube.usda@
+        )
+        {
+            rel material:binding = </materials/diffuse_white>
+            quatf xformOp:orient = (1, 0, 0, 0)
+            float3 xformOp:scale = (1, 1, 1)
+            double3 xformOp:translate = (0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+    }
+
+    def Xform "sphere" (
+        kind = "component"
+    )
+    {
+        quatf xformOp:orient = (1, 0, 0, 0)
+        float3 xformOp:scale = (30, 30, 30)
+        double3 xformOp:scale:unitsResolve = (0.01, 0.01, 0.01)
+        double3 xformOp:translate = (0.006171280052512884, 0.5080081189425787, 2.918431093096383)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
+
+        def "sphere" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend payload = @./sphere.usda@
         )
         {
             rel material:binding = </materials/diffuse_white>

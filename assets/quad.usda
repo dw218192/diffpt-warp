@@ -31,7 +31,7 @@
             double "rtx:post:chromaticAberration:strengthG" = -0.054999999701976776
         }
     }
-    defaultPrim = "/World/quad/Quad"
+    defaultPrim = "World"
     metersPerUnit = 0.01
     upAxis = "Y"
 )

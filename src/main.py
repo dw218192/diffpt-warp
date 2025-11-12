@@ -436,8 +436,13 @@ class CameraParams:
 
 class Renderer:
     def __init__(
-        self, width: int, usd_path: pathlib.Path, max_iter: int, max_depth: int
-    ):
+        self,
+        width: int,
+        usd_path: pathlib.Path,
+        max_iter: int,
+        max_depth: int,
+    ):  # height will be computed from width and fov set in the USD stage's camera prim
+
         self.cam_params = CameraParams()
 
         asset_stage: Usd.Stage = Usd.Stage.Open(usd_path.as_posix())
@@ -565,6 +570,10 @@ class Renderer:
             * np.tan(self.cam_params.fov_y * 0.5)
             / np.tan(self.cam_params.fov_x * 0.5)
         )
+        self.dev_pixels = wp.zeros(
+            self.width * self.height, dtype=wp.vec3, device="cuda"
+        )
+
         logger.info(f"Using Camera Params: {self.cam_params}")
         logger.info(
             f"Loaded {len(self.meshes)} meshes ({len(self.light_indices)} lights)"
@@ -658,6 +667,28 @@ class Renderer:
             )
             self._num_iter += 1
 
+    def get_pixels(self) -> np.ndarray:
+        wp.launch(
+            kernel=tonemap,
+            dim=self.width * self.height,
+            inputs=[
+                self.radiances,
+                self.dev_pixels,
+            ],
+        )
+        return self.dev_pixels.numpy().reshape((self.height, self.width, 3))
+
+    def get_debug_pixels(self) -> np.ndarray:
+        wp.launch(
+            kernel=tonemap,
+            dim=self.width * self.height,
+            inputs=[
+                self.debug_radiances,
+                self.dev_pixels,
+            ],
+        )
+        return self.dev_pixels.numpy().reshape((self.height, self.width, 3))
+
     def reset(self):
         self._num_iter = 0
         self._last_debug_radiance_depth = -1
@@ -691,7 +722,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-iter", type=int, default=100, help="Maximum number of iterations."
     )
-    parser.add_argument("--max-depth", type=int, default=10, help="Maximum path depth.")
+    parser.add_argument("--max-depth", type=int, default=5, help="Maximum path depth.")
 
     args = parser.parse_known_args()[0]
 
@@ -736,17 +767,14 @@ if __name__ == "__main__":
 
         textbox.on_submit(on_submit)
 
-        # pixel buffer for display on the screen
-        dev_pixels = wp.zeros(renderer.width * renderer.height, dtype=wp.vec3)
-
         im = ax.imshow(
-            dev_pixels.numpy().reshape((renderer.height, renderer.width, 3)),
+            np.zeros((renderer.height, renderer.width, 3)),
             origin="lower",
             interpolation="antialiased",
             aspect="equal",
         )
         im_direct_lights = ax_direct_lights.imshow(
-            dev_pixels.numpy().reshape((renderer.height, renderer.width, 3)),
+            np.zeros((renderer.height, renderer.width, 3)),
             origin="lower",
             interpolation="antialiased",
             aspect="equal",
@@ -775,28 +803,8 @@ if __name__ == "__main__":
         # main loop
         while g_running:
             renderer.render()
-            wp.launch(
-                kernel=tonemap,
-                dim=renderer.width * renderer.height,
-                inputs=[
-                    renderer.radiances,
-                    dev_pixels,
-                ],
-            )
-            im.set_data(
-                dev_pixels.numpy().reshape((renderer.height, renderer.width, 3))
-            )
-            wp.launch(
-                kernel=tonemap,
-                dim=renderer.width * renderer.height,
-                inputs=[
-                    renderer.debug_radiances,
-                    dev_pixels,
-                ],
-            )
-            im_direct_lights.set_data(
-                dev_pixels.numpy().reshape((renderer.height, renderer.width, 3))
-            )
+            im.set_data(renderer.get_pixels())
+            im_direct_lights.set_data(renderer.get_debug_pixels())
             fig.canvas.draw()
             fig.canvas.flush_events()
             label.set_text(f"Iteration: {renderer._num_iter}")
