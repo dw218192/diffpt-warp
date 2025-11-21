@@ -51,11 +51,15 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./quad.usda@
         )
         {
-            rel material:binding = </materials/diffuse_red>
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </materials/diffuse_red>
+            }
         }
     }
 
@@ -69,11 +73,15 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./quad.usda@
         )
         {
-            rel material:binding = </materials/diffuse_green>
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </materials/diffuse_green>
+            }
         }
     }
 
@@ -87,11 +95,15 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./quad.usda@
         )
         {
-            rel material:binding = </materials/diffuse_white>
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </materials/diffuse_white>
+            }
         }
     }
 
@@ -105,11 +117,15 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./quad.usda@
         )
         {
-            rel material:binding = </materials/diffuse_white>
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </materials/diffuse_white>
+            }
         }
     }
 
@@ -123,11 +139,15 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./quad.usda@
         )
         {
-            rel material:binding = </materials/diffuse_white>
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </materials/diffuse_white>
+            }
         }
     }
 
@@ -141,15 +161,20 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "cube" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./cube.usda@
         )
         {
-            rel material:binding = </materials/diffuse_white>
             quatf xformOp:orient = (1, 0, 0, 0)
             float3 xformOp:scale = (1, 1, 1)
             double3 xformOp:translate = (0.7005032709425458, -2.6645352591003757e-15, -0.5917343177436554)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+            over "Cube" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </materials/diffuse_white>
+            }
         }
     }
 
@@ -163,15 +188,15 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "cube" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./cube.usda@
         )
         {
-            rel material:binding = </materials/diffuse_white>
-            quatf xformOp:orient = (1, 0, 0, 0)
-            float3 xformOp:scale = (1, 1, 1)
-            double3 xformOp:translate = (0, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+            over "Cube" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </materials/diffuse_white>
+            }
         }
     }
 
@@ -186,11 +211,15 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
 
         def "sphere" (
-            prepend apiSchemas = ["MaterialBindingAPI"]
             prepend payload = @./sphere.usda@
         )
         {
-            rel material:binding = </materials/diffuse_white>
+            over "Sphere" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </materials/diffuse_white>
+            }
         }
     }
 }
@@ -230,7 +259,7 @@ def Xform "lights"
     {
         color3f inputs:color = (1, 1, 1)
         float inputs:height = 3
-        float inputs:intensity = 15
+        float inputs:intensity = 238
         float inputs:width = 3
         matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, -2.220446049250313e-16, -1, 0), (0, 1, -2.220446049250313e-16, 0), (0, 9.99, 0, 1) )
         uniform token[] xformOpOrder = ["xformOp:transform"]

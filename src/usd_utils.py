@@ -39,30 +39,41 @@ def get_mesh_points_and_indices(
     mesh_geom: UsdGeom.Mesh,
 ) -> tuple[np.ndarray, np.ndarray]:
     transform = get_world_transform(mesh_geom.GetPrim())
-    points = mesh_geom.GetPointsAttr().Get()
-    points = np.array([transform.TransformAffine(p) for p in points], dtype=np.float32)
+
+    # get and transform vertex positions
+    points = np.array(
+        [transform.TransformAffine(p) for p in mesh_geom.GetPointsAttr().Get()],
+        dtype=np.float32,
+    )
     assert points.shape[1] == 3
 
     counts = np.array(mesh_geom.GetFaceVertexCountsAttr().Get(), dtype=np.int32)
     indices = np.array(mesh_geom.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
 
-    # triangulate faces
-    tri_indices = []
-    orientation = mesh_geom.GetOrientationAttr().Get()
-    cursor = 0
-    for n in counts:
-        face = indices[cursor : cursor + n]
-        cursor += n
-        # fan triangulation: (v0, v1, v2), (v0, v2, v3), ...
-        for i in range(1, n - 1):
-            if orientation == "leftHanded":
-                tri_indices.extend([face[0], face[i + 1], face[i]])
-            else:
-                tri_indices.extend([face[0], face[i], face[i + 1]])
+    if not np.all(counts == 3):
+        raise ValueError(
+            f"Non-triangular faces detected; this is not supported: expected all counts == 3, got unique counts {np.unique(counts)}"
+        )
 
-    tri_indices = np.array(tri_indices, dtype=np.int32)
+    # sanity check for index count alignment
+    assert indices.size == 3 * counts.size, "Indices don't align with face count!"
 
-    return points, tri_indices
+    # check degenerate triangles
+    for i in range(indices.size // 3):
+        v1 = points[indices[3 * i]]
+        v2 = points[indices[3 * i + 1]]
+        v3 = points[indices[3 * i + 2]]
+        if np.allclose(v1, v2) or np.allclose(v1, v3) or np.allclose(v2, v3):
+            raise ValueError(f"Degenerate triangle detected: {v1}, {v2}, {v3}")
+
+    # check all indices are valid
+    for i in range(indices.size):
+        if indices[i] < 0 or indices[i] >= points.shape[0]:
+            raise ValueError(
+                f"Invalid index: {indices[i]}, expected range [0, {points.shape[0]})"
+            )
+
+    return points, indices
 
 
 def compute_mesh_surface_area(

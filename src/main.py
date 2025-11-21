@@ -261,6 +261,20 @@ def draw(
         ro, rd, meshes, min_t, max_t
     )
 
+    # if hit_mesh_idx != -1:
+    #     mesh = meshes[hit_mesh_idx]
+    #     v1, v2, v3 = get_triangle_points(mesh.mesh_id, hit_face_idx)
+    #     area = 0.5 * wp.length(wp.cross(v2 - v1, v3 - v1))
+    #     norm_area = area / mesh.surface_area
+    #     color = wp.vec3(norm_area, 0.0, 0.0)
+    #     if v1 == v2 or v1 == v3 or v2 == v3:
+    #         color = wp.vec3(0.0, 1.0, 0.0)
+    #     path.radiance = color
+
+    # path_segments[tid] = path
+    # path_flags[tid] = 1
+    # return
+
     if hit_mesh_idx != -1:
         normal_to_world_space = get_coord_system(hit_normal)
         world_to_normal_space = wp.transpose(normal_to_world_space)
@@ -290,7 +304,7 @@ def draw(
             path.radiance += mis_weight * contrib
 
             if path.depth == debug_radiance_depth:
-                path.debug_radiance += mis_weight * contrib
+                path.debug_radiance += contrib
 
             path_segments[tid] = path
             path_flags[tid] = 1
@@ -330,12 +344,8 @@ def draw(
 
                 path.radiance += mis_weight * contrib
 
-                if path.depth == debug_radiance_depth - 1:
-                    path.debug_radiance += mis_weight * contrib
-
-                path_segments[tid] = path
-                path_flags[tid] = 1
-                return
+                # if path.depth == debug_radiance_depth - 1:
+                #     path.debug_radiance += mis_weight * contrib
 
         # BSDF sampling
         wi = hemisphere_sample(rand_state)
@@ -435,6 +445,30 @@ class CameraParams:
 
 
 class Renderer:
+    """
+    Simple USD-based path tracer.
+
+    Args:
+        width: The width of the output image in pixels.
+        usd_path: The path to the USD file to render.
+        max_iter: The maximum number of iterations to run.
+        max_depth: The maximum depth of the path.
+
+    Returns:
+        The rendered image.
+
+    Constraints (for the sake of simplicity):
+        - The USD file must contain a camera prim.
+        - The USD file must contain at least one material.
+        - Non-triangular or degenerate faces are not supported.
+        - Only implements USD material binding API, activeness
+            - Material format is custom, not UsdShade
+            - No support for UsdLux
+        - Lights can only be
+            - meshes with UsdLux.MeshLightAPI
+            - UsdLux.RectLight
+    """
+
     def __init__(
         self,
         width: int,
@@ -475,9 +509,9 @@ class Renderer:
             is_light: bool,
         ) -> tuple[wp.Mesh, Mesh]:
             wp_mesh = wp.Mesh(
-                points=wp.array(points, dtype=wp.vec3),
+                points=wp.array(np.ascontiguousarray(points), dtype=wp.vec3),
                 velocities=None,
-                indices=wp.array(indices, dtype=int),
+                indices=wp.array(np.ascontiguousarray(indices), dtype=wp.int32),
             )
 
             assert len(indices) % 3 == 0
@@ -498,6 +532,9 @@ class Renderer:
                     material_path = binding.GetPrimPath()
                     mesh.material_id = wp.uint64(mat_prim_path_to_mat_id[material_path])
             else:
+                print(
+                    f"No material binding found for {prim.GetPrimPath()}, using the first material"
+                )
                 mesh.material_id = wp.uint64(0)
 
             return wp_mesh, mesh

@@ -10,16 +10,9 @@ import matplotlib.pyplot as plt
 def get_triangle_points(
     mesh_id: wp.uint64, face_idx: int
 ) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    i1 = wp.mesh_get_index(mesh_id, 3 * face_idx)
-    i2 = wp.mesh_get_index(mesh_id, 3 * face_idx + 1)
-    i3 = wp.mesh_get_index(mesh_id, 3 * face_idx + 2)
-    v1 = wp.mesh_get_point(mesh_id, i1)
-    v2 = wp.mesh_get_point(mesh_id, i2)
-    v3 = wp.mesh_get_point(mesh_id, i3)
-
-    area = 0.5 * wp.length(wp.cross(v2 - v1, v3 - v1))
-    # if area <= 1e-5:
-    #     wp.printf("area: %f\n", area)
+    v1 = wp.mesh_get_point(mesh_id, 3 * face_idx)
+    v2 = wp.mesh_get_point(mesh_id, 3 * face_idx + 1)
+    v3 = wp.mesh_get_point(mesh_id, 3 * face_idx + 2)
     return v1, v2, v3
 
 

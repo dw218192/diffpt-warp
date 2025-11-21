@@ -45,40 +45,32 @@ def Xform "World" (
     double3 xformOp:translate = (0, 0, 0)
     uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
 
-    def Xform "quad"
+    def Mesh "Quad"
     {
-        quatf xformOp:orient = (1, 0, 0, 0)
-        float3 xformOp:scale = (1, 1, 1)
-        double3 xformOp:translate = (0, 0, 0)
-        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        float3[] extent = [(-1, -1, 0), (1, 1, 0)]
+        int[] faceVertexCounts = [3, 3]
+        int[] faceVertexIndices = [0, 1, 2, 0, 2, 3]
 
-        def Mesh "Quad"
-        {
-            float3[] extent = [(-1, -1, 0), (1, 1, 0)]
-            int[] faceVertexCounts = [3, 3]
-            int[] faceVertexIndices = [0, 1, 2, 0, 2, 3]
+        point3f[] points = [
+            (-1, -1, 0),
+            (1, -1, 0),
+            (1, 1, 0),
+            (-1, 1, 0)
+        ]
 
-            point3f[] points = [
-                (-1, -1, 0),
-                (1, -1, 0),
-                (1, 1, 0),
-                (-1, 1, 0)
-            ]
+        normal3f[] normals = [(0, 0, 1)] (
+            interpolation = "constant"
+        )
 
-            normal3f[] normals = [(0, 0, 1)] (
-                interpolation = "constant"
-            )
+        texCoord2f[] primvars:st = [
+            (0, 0),
+            (1, 0),
+            (1, 1),
+            (0, 1)
+        ] (
+            interpolation = "vertex"
+        )
 
-            texCoord2f[] primvars:st = [
-                (0, 0),
-                (1, 0),
-                (1, 1),
-                (0, 1)
-            ] (
-                interpolation = "vertex"
-            )
-
-            uniform token subdivisionScheme = "none"
-        }
+        uniform token subdivisionScheme = "none"
     }
 }
