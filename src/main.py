@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 EPSILON = 1e-4
+MAT_ID_DIFFUSE = 0
+MAT_ID_SPECULAR = 1
 
 
 @wp.struct
@@ -109,19 +111,48 @@ def init_path_segments(
     path_flags[tid] = 0
 
 
+# ================= BSDF =================
 @wp.func
-def shade(
+def mat_eval_bsdf(
+    material: Material,
     wi: wp.vec3,  # in normal space
     wo: wp.vec3,  # in normal space, towards 'sensor'
     mesh: Mesh,
-    material: Material,
 ) -> wp.vec3:
-    if material.type == 0:  # diffuse
+    if material.type == MAT_ID_DIFFUSE:  # diffuse
         return material.color / wp.pi
 
     return wp.vec3(0.0, 0.0, 0.0)
 
 
+@wp.func
+def mat_sample(
+    material: Material,
+    rand_state: wp.uint32,
+    wi: wp.vec3,  # in normal space
+    wo: wp.vec3,  # in normal space, towards 'sensor'
+    mesh: Mesh,
+) -> wp.vec3:
+    if material.type == MAT_ID_DIFFUSE:  # diffuse
+        return hemisphere_sample(rand_state)
+
+    return wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.func
+def mat_pdf(
+    material: Material,
+    wi: wp.vec3,  # in normal space
+    wo: wp.vec3,  # in normal space, towards 'sensor'
+    mesh: Mesh,
+) -> float:
+    if material.type == MAT_ID_DIFFUSE:  # diffuse
+        return hemisphere_pdf(wi)
+
+    return 0.0
+
+
+# ========================================
 @wp.func
 def scene_intersect(
     ro: wp.vec3,
@@ -261,20 +292,6 @@ def draw(
         ro, rd, meshes, min_t, max_t
     )
 
-    # if hit_mesh_idx != -1:
-    #     mesh = meshes[hit_mesh_idx]
-    #     v1, v2, v3 = get_triangle_points(mesh.mesh_id, hit_face_idx)
-    #     area = 0.5 * wp.length(wp.cross(v2 - v1, v3 - v1))
-    #     norm_area = area / mesh.surface_area
-    #     color = wp.vec3(norm_area, 0.0, 0.0)
-    #     if v1 == v2 or v1 == v3 or v2 == v3:
-    #         color = wp.vec3(0.0, 1.0, 0.0)
-    #     path.radiance = color
-
-    # path_segments[tid] = path
-    # path_flags[tid] = 1
-    # return
-
     if hit_mesh_idx != -1:
         normal_to_world_space = get_coord_system(hit_normal)
         world_to_normal_space = wp.transpose(normal_to_world_space)
@@ -327,16 +344,17 @@ def draw(
         ):
             wi = world_to_normal_space * wp.normalize(light_sample_point - hit_point)
             if wi.z > 0.0:
-                bsdf_pdf = hemisphere_pdf(wi)
+                bsdf_pdf = mat_pdf(mat, wi, wo, mesh)
                 light_pdf_solid_angle = (
                     area_to_solid_angle(hit_point, light_sample_point, light_normal)
                     * light_pdf_area
                 )
                 mis_weight = power_heuristic(light_pdf_solid_angle, bsdf_pdf)
                 light_mesh = meshes[light_mesh_idx]
+
                 contrib = wp.cw_mul(
                     path.throughput,
-                    shade(wi, wo, mesh, mat) * wi.z / light_pdf_solid_angle,
+                    mat_eval_bsdf(mat, wi, wo, mesh) * wi.z / light_pdf_solid_angle,
                 )
 
                 Le = light_mesh.light_intensity * light_mesh.light_color
@@ -344,12 +362,12 @@ def draw(
 
                 path.radiance += mis_weight * contrib
 
-                # if path.depth == debug_radiance_depth - 1:
-                #     path.debug_radiance += mis_weight * contrib
+                if path.depth == debug_radiance_depth - 1:
+                    path.debug_radiance += mis_weight * contrib
 
         # BSDF sampling
-        wi = hemisphere_sample(rand_state)
-        pdf = hemisphere_pdf(wi)
+        wi = mat_sample(mat, rand_state, wi, wo, mesh)
+        pdf = mat_pdf(mat, wi, wo, mesh)
         if pdf <= 0.0 or wi.z < 0.0:
             path.radiance = wp.vec3(0.0, 0.0, 0.0)
             path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
@@ -361,7 +379,7 @@ def draw(
         path.ray_dir = normal_to_world_space * wi
         path.throughput = wp.cw_mul(
             path.throughput,
-            shade(wi, wo, mesh, mat) * wi.z / pdf,
+            mat_eval_bsdf(mat, wi, wo, mesh) * wi.z / pdf,
         )
         path.depth += 1
 
