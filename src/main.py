@@ -21,16 +21,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.widgets import TextBox
 
-from usd_utils import (
-    extract_pos,
-    get_world_transform,
-    get_mesh_points_and_indices,
-    compute_mesh_surface_area,
-)
-
+from usd_utils import extract_pos
 from warp_math_utils import (
-    hemisphere_sample,
-    hemisphere_pdf,
     get_coord_system,
     triangle_sample,
     power_heuristic,
@@ -38,30 +30,22 @@ from warp_math_utils import (
     get_triangle_points,
 )
 
+from mesh import (
+    Mesh,
+    create_mesh_from_usd_prim,
+)
+from material import (
+    Material,
+    create_material_from_usd_prim,
+    mat_eval_bsdf,
+    mat_sample,
+    mat_pdf,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 EPSILON = 1e-4
-MAT_ID_DIFFUSE = 0
-MAT_ID_SPECULAR = 1
-
-
-@wp.struct
-class Material:
-    type: wp.uint16  # 0: diffuse, 1: specular
-    color: wp.vec3
-
-
-@wp.struct
-class Mesh:
-    mesh_id: wp.uint64  # warp mesh id
-    material_id: wp.uint64
-    num_faces: wp.int32
-    surface_area: wp.float32
-    is_light: wp.bool
-    light_intensity: wp.float32
-    light_color: wp.vec3
 
 
 @wp.struct
@@ -111,48 +95,6 @@ def init_path_segments(
     path_flags[tid] = 0
 
 
-# ================= BSDF =================
-@wp.func
-def mat_eval_bsdf(
-    material: Material,
-    wi: wp.vec3,  # in normal space
-    wo: wp.vec3,  # in normal space, towards 'sensor'
-    mesh: Mesh,
-) -> wp.vec3:
-    if material.type == MAT_ID_DIFFUSE:  # diffuse
-        return material.color / wp.pi
-
-    return wp.vec3(0.0, 0.0, 0.0)
-
-
-@wp.func
-def mat_sample(
-    material: Material,
-    rand_state: wp.uint32,
-    wi: wp.vec3,  # in normal space
-    wo: wp.vec3,  # in normal space, towards 'sensor'
-    mesh: Mesh,
-) -> wp.vec3:
-    if material.type == MAT_ID_DIFFUSE:  # diffuse
-        return hemisphere_sample(rand_state)
-
-    return wp.vec3(0.0, 0.0, 0.0)
-
-
-@wp.func
-def mat_pdf(
-    material: Material,
-    wi: wp.vec3,  # in normal space
-    wo: wp.vec3,  # in normal space, towards 'sensor'
-    mesh: Mesh,
-) -> float:
-    if material.type == MAT_ID_DIFFUSE:  # diffuse
-        return hemisphere_pdf(wi)
-
-    return 0.0
-
-
-# ========================================
 @wp.func
 def scene_intersect(
     ro: wp.vec3,
@@ -344,7 +286,7 @@ def draw(
         ):
             wi = world_to_normal_space * wp.normalize(light_sample_point - hit_point)
             if wi.z > 0.0:
-                bsdf_pdf = mat_pdf(mat, wi, wo, mesh)
+                bsdf_pdf = mat_pdf(mat, wi, wo)
                 light_pdf_solid_angle = (
                     area_to_solid_angle(hit_point, light_sample_point, light_normal)
                     * light_pdf_area
@@ -354,7 +296,7 @@ def draw(
 
                 contrib = wp.cw_mul(
                     path.throughput,
-                    mat_eval_bsdf(mat, wi, wo, mesh) * wi.z / light_pdf_solid_angle,
+                    mat_eval_bsdf(mat, wi, wo) * wi.z / light_pdf_solid_angle,
                 )
 
                 Le = light_mesh.light_intensity * light_mesh.light_color
@@ -366,8 +308,8 @@ def draw(
                     path.debug_radiance += mis_weight * contrib
 
         # BSDF sampling
-        wi = mat_sample(mat, rand_state, wi, wo, mesh)
-        pdf = mat_pdf(mat, wi, wo, mesh)
+        wi = mat_sample(mat, rand_state, wo)
+        pdf = mat_pdf(mat, wi, wo)
         if pdf <= 0.0 or wi.z < 0.0:
             path.radiance = wp.vec3(0.0, 0.0, 0.0)
             path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
@@ -379,7 +321,7 @@ def draw(
         path.ray_dir = normal_to_world_space * wi
         path.throughput = wp.cw_mul(
             path.throughput,
-            mat_eval_bsdf(mat, wi, wo, mesh) * wi.z / pdf,
+            mat_eval_bsdf(mat, wi, wo) * wi.z / pdf,
         )
         path.depth += 1
 
@@ -505,104 +447,16 @@ class Renderer:
         self.materials = []
         mat_prim_path_to_mat_id = {}
 
-        def create_material(prim: Usd.Prim):
-            type = prim.GetAttribute("pbr:type").Get()
-            color = prim.GetAttribute("pbr:color").Get()
-            material = Material()
-
-            if type == "diffuse":
-                material.type = 0
-            elif type == "specular":
-                material.type = 1
-            else:
-                raise ValueError(f"Unsupported material type: {type}")
-
-            material.color = color
-            return material
-
-        def create_mesh(
-            prim: Usd.Prim,
-            points: np.ndarray,
-            indices: np.ndarray,
-            is_light: bool,
-        ) -> tuple[wp.Mesh, Mesh]:
-            wp_mesh = wp.Mesh(
-                points=wp.array(np.ascontiguousarray(points), dtype=wp.vec3),
-                velocities=None,
-                indices=wp.array(np.ascontiguousarray(indices), dtype=wp.int32),
-            )
-
-            assert len(indices) % 3 == 0
-
-            mesh = Mesh()
-            mesh.mesh_id = wp_mesh.id
-            mesh.surface_area = compute_mesh_surface_area(points, indices)
-            mesh.num_faces = len(indices) // 3
-            mesh.is_light = is_light
-            if is_light:
-                mesh.light_intensity = prim.GetAttribute("inputs:intensity").Get()
-                mesh.light_color = prim.GetAttribute("inputs:color").Get()
-
-            if prim.HasAPI(UsdShade.MaterialBindingAPI):
-                material_binding = UsdShade.MaterialBindingAPI(prim)
-                for binding in material_binding.GetDirectBindingRel().GetTargets():
-                    # only the first material is used
-                    material_path = binding.GetPrimPath()
-                    mesh.material_id = wp.uint64(mat_prim_path_to_mat_id[material_path])
-            else:
-                print(
-                    f"No material binding found for {prim.GetPrimPath()}, using the first material"
-                )
-                mesh.material_id = wp.uint64(0)
-
-            return wp_mesh, mesh
-
         # collect all materials
         for prim in asset_stage.Traverse():
             if prim.IsA(UsdShade.Material):
-                material = create_material(prim)
+                material = create_material_from_usd_prim(prim)
                 self.materials.append(material)
                 mat_prim_path_to_mat_id[prim.GetPrimPath()] = len(self.materials) - 1
 
         # create rendering primitives
         for prim in asset_stage.Traverse():
-            if prim.IsA(UsdGeom.Mesh):
-                mesh_geom = UsdGeom.Mesh(prim)
-                is_light = prim.HasAPI(UsdLux.MeshLightAPI)
-
-                points, indices = get_mesh_points_and_indices(mesh_geom)
-                wp_mesh, mesh = create_mesh(prim, points, indices, is_light)
-                self.wp_meshes.append(wp_mesh)
-                self.meshes.append(mesh)
-
-                if is_light:
-                    self.light_indices.append(len(self.meshes) - 1)
-
-            elif prim.IsA(UsdLux.RectLight):
-                rect_light = UsdLux.RectLight(prim)
-                hx = rect_light.GetWidthAttr().Get() * 0.5
-                hy = rect_light.GetHeightAttr().Get() * 0.5
-                # vertices in local space (XY plane)
-                transform = get_world_transform(prim)
-                verts = np.array(
-                    [
-                        transform.TransformAffine((-hx, -hy, 0.0)),  # bottom-left
-                        transform.TransformAffine((hx, -hy, 0.0)),  # bottom-right
-                        transform.TransformAffine((hx, hy, 0.0)),  # top-right
-                        transform.TransformAffine((-hx, hy, 0.0)),  # top-left
-                    ],
-                    dtype=np.float32,
-                )
-                assert verts.shape[1] == 3
-                # two triangles (indices into verts)
-                indices = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
-
-                wp_mesh, mesh = create_mesh(prim, verts, indices, True)
-                self.wp_meshes.append(wp_mesh)
-                self.meshes.append(mesh)
-                self.light_indices.append(len(self.meshes) - 1)
-
-            elif prim.IsA(UsdGeom.Camera):
+            if prim.IsA(UsdGeom.Camera):
                 usd_cam = UsdGeom.Camera(prim)
                 cam_pos = extract_pos(prim)
 
@@ -618,6 +472,16 @@ class Renderer:
                 self.cam_params = CameraParams(
                     cam_pos, fov_x, fov_y, (clipping_range[0], clipping_range[1])
                 )
+            else:
+                res = create_mesh_from_usd_prim(prim, mat_prim_path_to_mat_id)
+                if res is None:
+                    continue
+
+                wp_mesh, mesh = res
+                self.wp_meshes.append(wp_mesh)
+                self.meshes.append(mesh)
+                if mesh.is_light:
+                    self.light_indices.append(len(self.meshes) - 1)
 
         self.width = width
         self.height = int(
