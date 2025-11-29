@@ -628,7 +628,7 @@ if __name__ == "__main__":
         "--usd-path",
         type=pathlib.Path,
         default=(
-            pathlib.Path(__file__).parent.parent / "assets" / "cornell.usda"
+            pathlib.Path(__file__).parent.parent / "stages" / "cornell.usda"
         ).resolve(),
         help="Path to the USD file to render.",
     )

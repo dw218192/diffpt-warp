@@ -8,7 +8,7 @@
             }
             dictionary Perspective = {
                 double3 position = (0.18654607260285921, 5.477318124824527, 5.570777200423979)
-                double3 target = (-0.2057545086571544, 1.9309071037674994, 2.97250425668099)
+                double3 target = (-0.2057545086571555, 1.9309071037674999, 2.9725042566809914)
             }
             dictionary Right = {
                 double3 position = (-500, 0, 0)
@@ -51,7 +51,7 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend payload = @./quad.usda@
+            prepend payload = @../assets/quad.usda@
         )
         {
             over "Quad" (
@@ -73,7 +73,7 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend payload = @./quad.usda@
+            prepend payload = @../assets/quad.usda@
         )
         {
             over "Quad" (
@@ -95,7 +95,7 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend payload = @./quad.usda@
+            prepend payload = @../assets/quad.usda@
         )
         {
             over "Quad" (
@@ -117,7 +117,7 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend payload = @./quad.usda@
+            prepend payload = @../assets/quad.usda@
         )
         {
             over "Quad" (
@@ -139,7 +139,7 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "quad" (
-            prepend payload = @./quad.usda@
+            prepend payload = @../assets/quad.usda@
         )
         {
             over "Quad" (
@@ -161,7 +161,7 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "cube" (
-            prepend payload = @./cube.usda@
+            prepend payload = @../assets/cube.usda@
         )
         {
             quatf xformOp:orient = (1, 0, 0, 0)
@@ -188,7 +188,7 @@ def Xform "geo" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 
         def "cube" (
-            prepend payload = @./cube.usda@
+            prepend payload = @../assets/cube.usda@
         )
         {
             over "Cube" (
@@ -207,18 +207,18 @@ def Xform "geo" (
         quatf xformOp:orient = (1, 0, 0, 0)
         float3 xformOp:scale = (30, 30, 30)
         double3 xformOp:scale:unitsResolve = (0.01, 0.01, 0.01)
-        double3 xformOp:translate = (0.006171280052512884, 0.5080081189425787, 2.918431093096383)
+        double3 xformOp:translate = (-0.037912092835133415, 2.847120767227577, -1.7414687772914723)
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
 
         def "sphere" (
-            prepend payload = @./sphere.usda@
+            prepend payload = @../assets/sphere.usda@
         )
         {
             over "Sphere" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/diffuse_white>
+                rel material:binding = </materials/glass>
             }
         }
     }
@@ -249,6 +249,7 @@ def Xform "materials" (
     def Material "glass"
     {
         color3f pbr:color = (1, 1, 1)
+        float pbr:ior = 1.44
         string pbr:type = "specular"
     }
 }
