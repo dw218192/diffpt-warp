@@ -4,23 +4,19 @@ from warp_math_utils import (
     hemisphere_sample,
     hemisphere_pdf,
 )
+import logging
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
-    "MAT_ID_DIFFUSE",
-    "MAT_ID_SPECULAR",
     "Material",
     "create_material_from_usd_prim",
+    "is_emissive",
     "mat_eval_bsdf",
     "mat_sample",
     "mat_pdf",
 ]
 
-MAT_ID_DIFFUSE = 0
-MAT_ID_SPECULAR = 1
-MAT_NAME_TO_ID = {
-    "diffuse": MAT_ID_DIFFUSE,
-    "specular": MAT_ID_SPECULAR,
-}
 EPSILON = 1e-6
 
 # here we'll partially implement the metallic-roughness part of the preview surface schema
@@ -34,6 +30,7 @@ class Material:
     roughness: float  # previewSurface:roughness
     ior: float  # previewSurface:ior (default 1.5)
     emissive_color: wp.vec3  # previewSurface:emissiveColor
+    emissive_intensity: float  # emissiveIntensity (custom attribute)
 
 
 def create_material_from_usd_prim(prim: UsdShade.Material):
@@ -56,6 +53,11 @@ def create_material_from_usd_prim(prim: UsdShade.Material):
     mat.roughness = get("roughness", 0.5)
     mat.ior = get("ior", 1.5)
     mat.emissive_color = get("emissiveColor", wp.vec3(0.0, 0.0, 0.0))
+
+    # custom attributes
+    mat.emissive_intensity = get("emissiveIntensity", 0.0)
+
+    logger.info(f"Material: {mat}")
     return mat
 
 
@@ -81,6 +83,15 @@ def is_perfect_lambertian(material: Material) -> wp.bool:
 @wp.func
 def is_perfect_mirror(material: Material) -> wp.bool:
     return material.metallic >= 1.0 - EPSILON and material.roughness <= EPSILON
+
+
+@wp.func
+def is_emissive(material: Material) -> wp.bool:
+    return (
+        material.emissive_color.x > EPSILON
+        or material.emissive_color.y > EPSILON
+        or material.emissive_color.z > EPSILON
+    )
 
 
 @wp.func
@@ -281,6 +292,7 @@ if __name__ == "__main__":
     m.ior = args.ior
     m.base_color = wp.vec3(args.base_color[0], args.base_color[1], args.base_color[2])
     m.emissive_color = wp.vec3(0.0, 0.0, 0.0)
+    m.emissive_intensity = 0.0
 
     # Outgoing direction (looking straight up)
     wo = wp.vec3(args.direction[0], args.direction[1], args.direction[2])

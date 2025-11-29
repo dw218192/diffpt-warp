@@ -84,7 +84,7 @@ def Scope "Materials" (
 
     def Material "mirror"
     {
-        token outputs:surface.connect = </Materials/glass/PreviewSurface.outputs:surface>
+        token outputs:surface.connect = </Materials/mirror/PreviewSurface.outputs:surface>
 
         def Shader "PreviewSurface"
         {
@@ -115,7 +115,7 @@ def Scope "Materials" (
             # for dielectric specular transmission
             color3f inputs:diffuseColor = (1.0, 1.0, 1.0)
             float inputs:metallic = 0.0
-            float inputs:roughness = 0.0     # perfectly glossy
+            float inputs:roughness = 0.0
 
             # Specular IOR-based reflection
             float inputs:ior = 1.44
@@ -123,6 +123,26 @@ def Scope "Materials" (
             # Enable glass-like transmission
             float inputs:opacity = 0.0
             token outputs:surface
+        }
+    }
+
+    def Material "emissive_white"
+    {
+        token outputs:surface.connect = </Materials/emissive_white/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+
+            # for dielectric specular transmission
+            color3f inputs:diffuseColor = (1.0, 1.0, 1.0)
+            color3f inputs:emissiveColor = (1.0, 1.0, 1.0)
+            float inputs:metallic = 0.0
+            float inputs:roughness = 1.0
+
+            token outputs:surface
+            
+            float inputs:emissiveIntensity = 30.0
         }
     }
 }

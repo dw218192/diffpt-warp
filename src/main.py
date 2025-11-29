@@ -37,6 +37,7 @@ from mesh import (
 from material import (
     Material,
     create_material_from_usd_prim,
+    is_emissive,
     mat_eval_bsdf,
     mat_sample,
     mat_pdf,
@@ -323,8 +324,13 @@ def draw(
             path.throughput,
             mat_eval_bsdf(mat, wi, wo) * wi.z / pdf,
         )
-        path.depth += 1
 
+        if is_emissive(mat):
+            path.radiance += wp.cw_mul(
+                path.throughput, mat.emissive_color * mat.emissive_intensity
+            )
+
+        path.depth += 1
         # russain roulette
         # the brighter the path, the higher the chance of its survival
         throughput = path.throughput
