@@ -35,6 +35,9 @@
     metersPerUnit = 1
     timeCodesPerSecond = 24
     upAxis = "Y"
+    subLayers = [
+        @../assets/materials.usda@
+    ]
 )
 
 def Xform "geo" (
@@ -58,7 +61,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/diffuse_red>
+                rel material:binding = </Materials/diffuse_red>
             }
         }
     }
@@ -80,7 +83,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/diffuse_green>
+                rel material:binding = </Materials/diffuse_green>
             }
         }
     }
@@ -102,7 +105,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/diffuse_white>
+                rel material:binding = </Materials/diffuse_white>
             }
         }
     }
@@ -124,7 +127,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/diffuse_white>
+                rel material:binding = </Materials/diffuse_white>
             }
         }
     }
@@ -146,7 +149,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/diffuse_white>
+                rel material:binding = </Materials/diffuse_white>
             }
         }
     }
@@ -173,7 +176,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/diffuse_white>
+                rel material:binding = </Materials/diffuse_white>
             }
         }
     }
@@ -195,7 +198,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/diffuse_white>
+                rel material:binding = </Materials/diffuse_white>
             }
         }
     }
@@ -218,39 +221,9 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </materials/glass>
+                rel material:binding = </Materials/mirror>
             }
         }
-    }
-}
-
-def Xform "materials" (
-    kind = "group"
-)
-{
-    def Material "diffuse_red"
-    {
-        color3f pbr:color = (1, 0, 0)
-        string pbr:type = "diffuse"
-    }
-
-    def Material "diffuse_green"
-    {
-        color3f pbr:color = (0, 1, 0)
-        string pbr:type = "diffuse"
-    }
-
-    def Material "diffuse_white"
-    {
-        color3f pbr:color = (1, 1, 1)
-        string pbr:type = "diffuse"
-    }
-
-    def Material "glass"
-    {
-        color3f pbr:color = (1, 1, 1)
-        float pbr:ior = 1.44
-        string pbr:type = "specular"
     }
 }
 

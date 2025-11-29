@@ -450,7 +450,7 @@ class Renderer:
         # collect all materials
         for prim in asset_stage.Traverse():
             if prim.IsA(UsdShade.Material):
-                material = create_material_from_usd_prim(prim)
+                material = create_material_from_usd_prim(UsdShade.Material(prim))
                 self.materials.append(material)
                 mat_prim_path_to_mat_id[prim.GetPrimPath()] = len(self.materials) - 1
 

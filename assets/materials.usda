@@ -1,0 +1,128 @@
+#usda 1.0
+(
+    customLayerData = {
+        dictionary cameraSettings = {
+            dictionary Front = {
+                double3 position = (0, 0, 50000)
+                double radius = 500
+            }
+            dictionary Perspective = {
+                double3 position = (1.0369923520471998, 2.0660488812681304, 4.080645042655207)
+                double3 target = (3.0594498268143866e-8, 9.418779089997997e-9, 4.642935804710646e-7)
+            }
+            dictionary Right = {
+                double3 position = (-50000, 0, 0)
+                double radius = 500
+            }
+            dictionary Top = {
+                double3 position = (0, 50000, 0)
+                double radius = 500
+            }
+            string boundCamera = "/OmniverseKit_Persp"
+        }
+        dictionary omni_layer = {
+            dictionary locked = {
+            }
+            dictionary muteness = {
+            }
+        }
+        dictionary renderSettings = {
+            double "rtx:post:chromaticAberration:strengthB" = -0.054999999701976776
+            double "rtx:post:chromaticAberration:strengthG" = -0.054999999701976776
+        }
+    }
+    defaultPrim = "World"
+    metersPerUnit = 0.01
+    upAxis = "Y"
+)
+
+def Scope "Materials" (
+    kind = "group"
+)
+{
+    def Material "diffuse_red"
+    {
+        token outputs:surface.connect = </Materials/diffuse_red/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor = (1.0, 0.0, 0.0)
+            float inputs:metallic = 0.0
+            float inputs:roughness = 1.0
+            token outputs:surface
+        }
+    }
+
+    def Material "diffuse_green"
+    {
+        token outputs:surface.connect = </Materials/diffuse_green/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor = (0.0, 1.0, 0.0)
+            float inputs:metallic = 0.0
+            float inputs:roughness = 1.0
+            token outputs:surface
+        }
+    }
+
+    def Material "diffuse_white"
+    {
+        token outputs:surface.connect = </Materials/diffuse_white/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor = (1.0, 1.0, 1.0)
+            float inputs:metallic = 0.0
+            float inputs:roughness = 1.0
+            token outputs:surface
+        }
+    }
+
+    def Material "mirror"
+    {
+        token outputs:surface.connect = </Materials/glass/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+
+            # for dielectric specular transmission
+            color3f inputs:diffuseColor = (1.0, 1.0, 1.0)
+            float inputs:metallic = 1.0
+            float inputs:roughness = 0.0     # perfectly glossy
+
+            # Specular IOR-based reflection
+            float inputs:ior = 1.44
+
+            # Enable glass-like transmission
+            float inputs:opacity = 1.0
+            token outputs:surface
+        }
+    }
+
+    def Material "glass"
+    {
+        token outputs:surface.connect = </Materials/glass/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+
+            # for dielectric specular transmission
+            color3f inputs:diffuseColor = (1.0, 1.0, 1.0)
+            float inputs:metallic = 0.0
+            float inputs:roughness = 0.0     # perfectly glossy
+
+            # Specular IOR-based reflection
+            float inputs:ior = 1.44
+
+            # Enable glass-like transmission
+            float inputs:opacity = 0.0
+            token outputs:surface
+        }
+    }
+}

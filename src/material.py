@@ -1,5 +1,5 @@
 import warp as wp
-from pxr import Usd
+from pxr import UsdShade
 from warp_math_utils import (
     hemisphere_sample,
     hemisphere_pdf,
@@ -23,25 +23,40 @@ MAT_NAME_TO_ID = {
 }
 EPSILON = 1e-6
 
+# here we'll partially implement the metallic-roughness part of the preview surface schema
+# USD preview surface schema: https://openusd.org/dev/spec_usdpreviewsurface.html#preview-surface
+
 
 @wp.struct
 class Material:
-    type: wp.uint16  # 0: diffuse, 1: specular
-    color: wp.vec3
-    ior: float
+    base_color: wp.vec3  # previewSurface:diffuseColor
+    metallic: float  # previewSurface:metallic
+    roughness: float  # previewSurface:roughness
+    ior: float  # previewSurface:ior (default 1.5)
+    emissive_color: wp.vec3  # previewSurface:emissiveColor
 
 
-def create_material_from_usd_prim(prim: Usd.Prim):
-    type = prim.GetAttribute("pbr:type").Get()
-    color = prim.GetAttribute("pbr:color").Get()
-    ior = prim.GetAttribute("pbr:ior").Get()
-    material = Material()
-    if type not in MAT_NAME_TO_ID:
-        raise ValueError(f"Unsupported material type: {type}")
-    material.type = MAT_NAME_TO_ID[type]
-    material.color = color
-    material.ior = ior or 1.5
-    return material
+def create_material_from_usd_prim(prim: UsdShade.Material):
+    """
+    Create a material from a USD material prim.
+    """
+    mat = Material()
+    # only one node is allowed
+    surface_output = prim.GetSurfaceOutput()
+    shader, _, _ = surface_output.GetConnectedSource()
+    shader = UsdShade.Shader(shader)
+
+    def get(attr, default):
+        a = shader.GetInput(attr)
+        val = a.Get()
+        return val if val is not None else default
+
+    mat.base_color = get("diffuseColor", wp.vec3(0.8, 0.8, 0.8))
+    mat.metallic = get("metallic", 0.0)
+    mat.roughness = get("roughness", 0.5)
+    mat.ior = get("ior", 1.5)
+    mat.emissive_color = get("emissiveColor", wp.vec3(0.0, 0.0, 0.0))
+    return mat
 
 
 @wp.func
@@ -59,6 +74,16 @@ def fresnel_dielectric(cos_theta_i: float, ior: float) -> float:
 
 
 @wp.func
+def is_perfect_lambertian(material: Material) -> wp.bool:
+    return material.metallic <= EPSILON and material.roughness >= 1.0 - EPSILON
+
+
+@wp.func
+def is_perfect_mirror(material: Material) -> wp.bool:
+    return material.metallic >= 1.0 - EPSILON and material.roughness <= EPSILON
+
+
+@wp.func
 def mat_eval_bsdf(
     material: Material,
     wi: wp.vec3,  # in normal space
@@ -68,16 +93,17 @@ def mat_eval_bsdf(
     Evaluate the BRDF for a given material and an incoming and outgoing direction.
     Returns the BRDF value.
     """
-    if material.type == MAT_ID_DIFFUSE:
-        return material.color / wp.pi
-    elif material.type == MAT_ID_SPECULAR:
+
+    if is_perfect_lambertian(material):
+        return material.base_color / wp.pi
+    elif is_perfect_mirror(material):
         if (
             wi.z > 0.0
             and wp.abs(wi.x + wo.x) < EPSILON
             and wp.abs(wi.y + wo.y) < EPSILON
             and wp.abs(wi.z - wo.z) < EPSILON
         ):
-            return fresnel_dielectric(wi.z, material.ior) * material.color / wi.z
+            return fresnel_dielectric(wi.z, material.ior) * material.base_color / wi.z
         else:
             return wp.vec3(0.0, 0.0, 0.0)
 
@@ -97,9 +123,9 @@ def mat_sample(
     The definition of incoming and outgoing directions is consistent with PBRT.
     """
 
-    if material.type == MAT_ID_DIFFUSE:
+    if is_perfect_lambertian(material):
         return hemisphere_sample(rand_state)
-    elif material.type == MAT_ID_SPECULAR:
+    elif is_perfect_mirror(material):
         return wp.vec3(-wo.x, -wo.y, wo.z)
 
     return wp.vec3(0.0, 0.0, 0.0)
@@ -115,9 +141,9 @@ def mat_pdf(
     Evaluate the PDF of a sampled incoming direction.
     """
 
-    if material.type == MAT_ID_DIFFUSE:
+    if is_perfect_lambertian(material):
         return hemisphere_pdf(wi)
-    elif material.type == MAT_ID_SPECULAR:
+    elif is_perfect_mirror(material):
         if (
             wp.abs(wi.x + wo.x) < EPSILON
             and wp.abs(wi.y + wo.y) < EPSILON
@@ -200,23 +226,26 @@ if __name__ == "__main__":
     import numpy as np
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-t",
-        "--material-type",
-        type=str,
-        default="diffuse",
-        choices=["diffuse", "specular"],
+    material_arg_parser = parser.add_argument_group("Material")
+    material_arg_parser.add_argument(
+        "-c",
+        "--base-color",
+        type=float,
+        nargs=3,
+        default=[0.8, 0.8, 0.8],
+        help="Base color of the material.",
+    )
+    material_arg_parser.add_argument(
+        "-m", "--metallic", type=float, default=0.0, help="Metallic of the material."
+    )
+    material_arg_parser.add_argument(
+        "-r", "--roughness", type=float, default=0.5, help="Roughness of the material."
+    )
+    material_arg_parser.add_argument(
+        "-i", "--ior", type=float, default=1.5, help="IOR of the material."
     )
     parser.add_argument(
         "-n", "--n-samples", type=int, default=1000, help="Number of samples."
-    )
-    parser.add_argument(
-        "-c",
-        "--color",
-        type=float,
-        nargs=3,
-        default=[1.0, 1.0, 1.0],
-        help="Color of the material.",
     )
     parser.add_argument(
         "-dir",
@@ -232,6 +261,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Use stochastic sampling to generate samples instead of uniform grid",
     )
+    parser.add_argument(
+        "-q",
+        "--quiver",
+        action="store_true",
+        help="Draw a quiver plot of the lobe instead of a mesh visualization",
+    )
+
     args = parser.parse_args()
 
     wp.init()
@@ -240,8 +276,11 @@ if __name__ == "__main__":
     # Material setup
     # ---------------------------
     m = Material()
-    m.type = MAT_NAME_TO_ID[args.material_type]
-    m.color = wp.vec3(args.color[0], args.color[1], args.color[2])
+    m.metallic = args.metallic
+    m.roughness = args.roughness
+    m.ior = args.ior
+    m.base_color = wp.vec3(args.base_color[0], args.base_color[1], args.base_color[2])
+    m.emissive_color = wp.vec3(0.0, 0.0, 0.0)
 
     # Outgoing direction (looking straight up)
     wo = wp.vec3(args.direction[0], args.direction[1], args.direction[2])
@@ -295,7 +334,7 @@ if __name__ == "__main__":
 
         return np.array(tris)
 
-    if args.material_type == "specular":
+    if args.quiver:
         origin = np.zeros((args.n_samples, 3))
         # Plot sampled outgoing directions as vectors
         ax.quiver(
@@ -347,5 +386,7 @@ if __name__ == "__main__":
         ax.set_ylim(-max_range, max_range)
         ax.set_zlim(0, max_range)
 
-    ax.set_title(f"{args.material_type} BRDF ({args.n_samples} samples)")
+    ax.set_title(
+        f"BRDF Lobe Visualization ({args.n_samples} samples, metallic={args.metallic}, roughness={args.roughness}, ior={args.ior})"
+    )
     plt.show()
