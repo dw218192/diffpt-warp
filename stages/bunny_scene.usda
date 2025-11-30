@@ -85,7 +85,7 @@ def Xform "World"
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/diffuse_white>
+                rel material:binding = </Materials/plastic_grey>
             }
         }
     }

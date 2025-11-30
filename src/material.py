@@ -1,6 +1,7 @@
 import warp as wp
 from pxr import UsdShade
 from warp_math_utils import (
+    concentric_disk_sample,
     hemisphere_sample,
     hemisphere_pdf,
 )
@@ -57,7 +58,7 @@ def create_material_from_usd_prim(prim: UsdShade.Material):
     # custom attributes
     mat.emissive_intensity = get("emissiveIntensity", 0.0)
 
-    logger.info(f"Material: {mat}")
+    logger.debug(f"Material: {mat}")
     return mat
 
 
@@ -74,6 +75,102 @@ def fresnel_dielectric(cos_theta_i: float, ior: float) -> float:
     F_0 = F_0 * F_0
     return F_0 + (1.0 - F_0) * wp.pow(1.0 - cos_theta_i, 5.0)
 
+
+@wp.func
+def fresnel_metal(cos_theta_i: float, F_0: wp.vec3) -> wp.vec3:
+    """
+    Fresnel term for a metallic material.
+    """
+    cos_theta_i = wp.clamp(cos_theta_i, -1.0, 1.0)
+    if cos_theta_i < 0.0:
+        return wp.vec3(0.0, 0.0, 0.0)
+
+    factor = pow(1.0 - cos_theta_i, 5.0)
+    result = wp.vec3(0.0, 0.0, 0.0)
+    result.x = F_0.x + (1.0 - F_0.x) * factor
+    result.y = F_0.y + (1.0 - F_0.y) * factor
+    result.z = F_0.z + (1.0 - F_0.z) * factor
+    return result
+
+
+@wp.func
+def ggx_d(cos_theta_m: float, roughness: float) -> float:
+    """
+    GGX normal distribution function.
+    cos_theta_m is the cosine of the angle between the surface normal and the microfacet normal.
+    """
+    if cos_theta_m <= 0.0:
+        return 0.0
+    alpha = roughness * roughness
+    return alpha / (
+        wp.pi * wp.pow(cos_theta_m * cos_theta_m * (alpha - 1.0) + 1.0, 2.0)
+    )
+
+
+@wp.func
+def _ggx_smith_g1(cos_theta: float, roughness: float) -> float:
+    if cos_theta <= 0.0:
+        return 0.0
+    alpha = roughness * roughness
+    return (
+        2.0
+        * cos_theta
+        / (cos_theta + wp.sqrt(alpha + (1.0 - alpha) * cos_theta * cos_theta))
+    )
+
+
+@wp.func
+def ggx_g(cos_theta_wi: float, cos_theta_wo: float, roughness: float) -> float:
+    """
+    Smith's shadowing-masking function for GGX.
+    cos_theta_wi is the cosine of the angle between the incoming direction and the surface normal.
+    cos_theta_wo is the cosine of the angle between the outgoing direction (inverse viewing direction) and the surface normal.
+    """
+    return _ggx_smith_g1(cos_theta_wi, roughness) * _ggx_smith_g1(
+        cos_theta_wo, roughness
+    )
+
+
+@wp.func
+def ggx_pdf(cos_theta_wo: float, cos_theta_m: float, roughness: float) -> float:
+    """
+    Probability density function for the projected area of the visible microfacets.
+    cos_theta_wo is the cosine of the angle between the outgoing direction (inverse viewing direction) and the surface normal.
+    cos_theta_m is the cosine of the angle between the surface normal and the sampled microfacet normal.
+    """
+    return (
+        _ggx_smith_g1(cos_theta_wo, roughness)
+        / wp.abs(cos_theta_wo)
+        * ggx_d(cos_theta_m, roughness)
+        * wp.abs(cos_theta_m)
+    )
+
+
+@wp.func
+def ggx_sample(rand_state: wp.uint32, wo: wp.vec3, roughness: float) -> wp.vec3:
+    """
+    Sample a microfacet normal for the GGX distribution using Heitz's method.
+    wo is the outgoing direction (inverse viewing direction) in normal space.
+    """
+    alpha = roughness * roughness
+    wh = wp.normalize(wp.vec3(alpha * wo.x, alpha * wo.y, wo.z))
+    if wh.z < 0.0:
+        wh = -wh
+    
+    # construct a coordinate system with wh as the z-axis
+    T1 = wp.normalize(wp.cross(wp.vec3(0.0, 0.0, 1.0), wh)) if wh.z < 0.99999 else wp.vec3(1.0, 0.0, 0.0)
+    T2 = wp.cross(wh, T1)
+    u = concentric_disk_sample(rand_state)
+
+    # warp u to the hemisphere projection (half-disk foreshortened by the cosine of wh)
+    h = wp.sqrt(1.0 - u.x * u.x)
+    u.y = wp.lerp(h, u.y, (1.0 + wh.z) / 2.0)
+
+    # project back to hemisphere and unstretch
+    nh = u.x * T1 + u.y * T2 + wp.sqrt(wp.max(0.0, 1.0 - u.x * u.x - u.y * u.y)) * wh
+    nh = wp.vec3(nh.x * alpha, nh.y * alpha, wp.max(1e-6, nh.z))
+    nh = wp.normalize(nh)
+    return nh
 
 @wp.func
 def is_perfect_lambertian(material: Material) -> wp.bool:
@@ -118,7 +215,28 @@ def mat_eval_bsdf(
         else:
             return wp.vec3(0.0, 0.0, 0.0)
 
-    return wp.vec3(0.0, 0.0, 0.0)
+    cos_theta_wi = wi.z
+    cos_theta_wo = wo.z
+    if cos_theta_wi <= 0.0 or cos_theta_wo <= 0.0:
+        return wp.vec3(0.0, 0.0, 0.0)
+
+    h = wp.normalize(wi + wo)
+    metal_f = fresnel_metal(cos_theta_wi, material.base_color) * material.metallic
+    dielectric_f = fresnel_dielectric(cos_theta_wi, material.ior) * (
+        1.0 - material.metallic
+    )
+    F = wp.vec3(
+        metal_f.x + dielectric_f,
+        metal_f.y + dielectric_f,
+        metal_f.z + dielectric_f,
+    )
+    D = ggx_d(h.z, material.roughness)
+    G = ggx_g(cos_theta_wi, cos_theta_wo, material.roughness)
+
+    specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
+    diffuse = material.base_color * (1.0 - material.metallic) / wp.pi
+
+    return specular + diffuse
 
 
 @wp.func
@@ -139,7 +257,9 @@ def mat_sample(
     elif is_perfect_mirror(material):
         return wp.vec3(-wo.x, -wo.y, wo.z)
 
-    return wp.vec3(0.0, 0.0, 0.0)
+    h = ggx_sample(rand_state, wo, material.roughness)
+    wi = 2.0 * wp.dot(wo, h) * h - wo
+    return wi
 
 
 @wp.func
@@ -163,7 +283,9 @@ def mat_pdf(
             return 1.0
         return 0.0
 
-    return 0.0
+    h = wp.normalize(wi + wo)
+    cos_theta_m = h.z
+    return ggx_pdf(wo.z, cos_theta_m, material.roughness)
 
 
 # ---------------------------------------
@@ -270,16 +392,24 @@ if __name__ == "__main__":
         "-s",
         "--stochastic",
         action="store_true",
-        help="Use stochastic sampling to generate samples instead of uniform grid",
-    )
-    parser.add_argument(
-        "-q",
-        "--quiver",
-        action="store_true",
-        help="Draw a quiver plot of the lobe instead of a mesh visualization",
+        help="Use stochastic sampling to generate samples for comparison",
     )
 
     args = parser.parse_args()
+
+    # validate
+    if args.metallic < 0.0 or args.metallic > 1.0:
+        raise ValueError("Metallic must be between 0.0 and 1.0")
+    if args.roughness < 0.0 or args.roughness > 1.0:
+        raise ValueError("Roughness must be between 0.0 and 1.0")
+    if args.ior < 1.0 or args.ior > 2.0:
+        raise ValueError("IOR must be between 1.0 and 2.0")
+    if args.base_color[0] < 0.0 or args.base_color[0] > 1.0:
+        raise ValueError("Base color must be between 0.0 and 1.0")
+    if args.base_color[1] < 0.0 or args.base_color[1] > 1.0:
+        raise ValueError("Base color must be between 0.0 and 1.0")
+    if args.base_color[2] < 0.0 or args.base_color[2] > 1.0:
+        raise ValueError("Base color must be between 0.0 and 1.0")
 
     wp.init()
 
@@ -301,28 +431,37 @@ if __name__ == "__main__":
     # ---------------------------
     # Sample BRDF
     # ---------------------------
-    out_dirs = wp.empty(args.n_samples, dtype=wp.vec3, device="cuda")
     # Compute grid dimensions: num_theta * num_phi should equal n_samples
     num_theta = int(np.sqrt(args.n_samples))
     num_phi = args.n_samples // num_theta
 
+    # Always generate uniform grid samples for mesh plot
+    in_dirs = wp.empty(args.n_samples, dtype=wp.vec3, device="cuda")
+    mesh_samples = wp.empty(args.n_samples, dtype=wp.vec3, device="cuda")
+
+    wp.launch(
+        kernel=gen_hemisphere_dirs,
+        dim=args.n_samples,
+        inputs=[num_theta, num_phi, in_dirs],
+    )
+    wp.launch(
+        kernel=sample_brdf, dim=args.n_samples, inputs=[m, wo, in_dirs, mesh_samples]
+    )
+
+    # Generate stochastic samples if requested
+    stochastic_samples = None
     if args.stochastic:
+        stochastic_samples = wp.empty(args.n_samples, dtype=wp.vec3, device="cuda")
         wp.launch(
-            kernel=sample_brdf_stochastic, dim=args.n_samples, inputs=[m, wo, out_dirs]
-        )
-    else:
-        in_dirs = wp.empty(args.n_samples, dtype=wp.vec3, device="cuda")
-
-        wp.launch(
-            kernel=gen_hemisphere_dirs,
+            kernel=sample_brdf_stochastic,
             dim=args.n_samples,
-            inputs=[num_theta, num_phi, in_dirs],
-        )
-        wp.launch(
-            kernel=sample_brdf, dim=args.n_samples, inputs=[m, wo, in_dirs, out_dirs]
+            inputs=[m, wo, stochastic_samples],
         )
 
-    samples = out_dirs.numpy()
+    mesh_samples_np = mesh_samples.numpy()
+    stochastic_samples_np = (
+        stochastic_samples.numpy() if stochastic_samples is not None else None
+    )
 
     # ---------------------------
     # 3D Visualization
@@ -346,22 +485,33 @@ if __name__ == "__main__":
 
         return np.array(tris)
 
-    if args.quiver:
-        origin = np.zeros((args.n_samples, 3))
+    # Always plot mesh visualization
+    tris = build_triangles(num_theta, num_phi)
+    verts = mesh_samples_np[tris]  # shape = (F, 3, 3)
+
+    mesh = Poly3DCollection(verts, alpha=0.6)
+    vals = np.linalg.norm(mesh_samples_np, axis=1)
+    mesh.set_array(vals)
+    mesh.set_cmap("viridis")
+    mesh.set_clim(vmin=vals.min(), vmax=vals.max())
+
+    ax.add_collection3d(mesh)
+
+    # Plot stochastic samples if provided
+    if stochastic_samples_np is not None:
         # Plot sampled outgoing directions as vectors
-        ax.quiver(
-            origin[:, 0],
-            origin[:, 1],
-            origin[:, 2],
-            samples[:, 0],
-            samples[:, 1],
-            samples[:, 2],
-            length=1.0,
-            normalize=True,
-            color="blue",
+        ax.scatter(
+            stochastic_samples_np[:, 0],
+            stochastic_samples_np[:, 1],
+            stochastic_samples_np[:, 2],
+            color="red",
+            s=2,
+            alpha=0.7,
+            label="Stochastic samples",
         )
 
         # Also plot the reference outgoing direction wo
+        origin = np.zeros((1, 3))
         ax.quiver(
             origin[:, 0],
             origin[:, 1],
@@ -372,33 +522,29 @@ if __name__ == "__main__":
             length=1.0,
             normalize=True,
             color="green",
+            label="Outgoing direction",
         )
-        wo_np = np.array([wo[0], wo[1], wo[2]])
-        ax.set_xlim(-1, 1)
-        ax.set_ylim(-1, 1)
-        ax.set_zlim(0, 1)
-    else:
-        # 3D Mesh Visualization
-        # Compute triangles
-        tris = build_triangles(num_theta, num_phi)
 
-        # Collect vertices
-        verts = samples[tris]  # shape = (F, 3, 3)
+        # Count number of degenerate samples
+        degenerate_samples = np.sum(np.linalg.norm(stochastic_samples_np, axis=1) < EPSILON)
+        logger.warning(f"Number of degenerate samples: {degenerate_samples}/{args.n_samples}")
 
-        mesh = Poly3DCollection(verts, alpha=0.8)
-        mesh.set_facecolor((0.8, 0.3, 0.3, 1.0))  # optional
-        vals = np.linalg.norm(samples, axis=1)
-        mesh.set_array(vals)
-        mesh.set_cmap("viridis")
-        mesh.set_clim(vmin=vals.min(), vmax=vals.max())
-
-        ax.add_collection3d(mesh)
-        max_range = np.max(np.abs(samples))
-        ax.set_xlim(-max_range, max_range)
-        ax.set_ylim(-max_range, max_range)
-        ax.set_zlim(0, max_range)
-
-    ax.set_title(
-        f"BRDF Lobe Visualization ({args.n_samples} samples, metallic={args.metallic}, roughness={args.roughness}, ior={args.ior})"
+    # Set axis limits based on both datasets
+    all_samples = (
+        np.vstack([mesh_samples_np, stochastic_samples_np])
+        if stochastic_samples_np is not None
+        else mesh_samples_np
     )
+    max_range = np.max(np.abs(all_samples))
+    ax.set_xlim(-max_range, max_range)
+    ax.set_ylim(-max_range, max_range)
+    ax.set_zlim(0, max_range)
+
+    if stochastic_samples_np is not None:
+        ax.legend()
+
+    title = f"BRDF Lobe Visualization ({args.n_samples} samples, metallic={args.metallic}, roughness={args.roughness}, ior={args.ior})"
+    if stochastic_samples_np is not None:
+        title += " [Mesh + Stochastic]"
+    ax.set_title(title)
     plt.show()
