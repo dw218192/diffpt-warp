@@ -7,8 +7,8 @@
                 double radius = 500
             }
             dictionary Perspective = {
-                double3 position = (0.18654607260285921, 5.477318124824527, 5.570777200423979)
-                double3 target = (-0.2057545086571555, 1.9309071037674999, 2.9725042566809914)
+                double3 position = (-1.7121576663671143, 4.6379013312368285, 8.995150244132823)
+                double3 target = (-0.22889088017691295, 1.7479314573597313, 2.704728019936737)
             }
             dictionary Right = {
                 double3 position = (-500, 0, 0)
@@ -31,11 +31,11 @@
     defaultPrim = "geo"
     framesPerSecond = 24
     metersPerUnit = 1
-    timeCodesPerSecond = 24
-    upAxis = "Y"
     subLayers = [
         @../assets/materials.usda@
     ]
+    timeCodesPerSecond = 24
+    upAxis = "Y"
 )
 
 def Xform "geo" (
@@ -152,51 +152,30 @@ def Xform "geo" (
         }
     }
 
-    def Xform "box1" (
+    def Xform "sphere" (
         kind = "component"
     )
     {
-        double3 xformOp:rotateXYZ = (0, 30, 0)
-        double3 xformOp:scale = (1, 1, 1)
-        double3 xformOp:translate = (-2.3319842075802537, 0.9999999999999307, 0.9429324389820959)
-        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+        quatf xformOp:orient = (1, 0, 0, 0)
+        float3 xformOp:scale = (30, 30, 30)
+        double3 xformOp:scale:unitsResolve = (0.01, 0.01, 0.01)
+        double3 xformOp:translate = (-0.037912092835133415, 2.847120767227577, -4.236070109955443)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
 
-        def "cube" (
-            prepend payload = @../assets/cube.usda@
+        def "sphere" (
+            prepend payload = @../assets/sphere.usda@
         )
         {
             quatf xformOp:orient = (1, 0, 0, 0)
-            float3 xformOp:scale = (1, 1, 1)
-            double3 xformOp:translate = (0.7005032709425458, -2.6645352591003757e-15, -0.5917343177436554)
+            float3 xformOp:scale = (3, 3, 3)
+            double3 xformOp:translate = (0, -3.3977100397486506, 14.736877863105654)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
 
-            over "Cube" (
+            over "Sphere" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/diffuse_white>
-            }
-        }
-    }
-
-    def Xform "box2" (
-        kind = "component"
-    )
-    {
-        double3 xformOp:rotateXYZ = (0, -30, 0)
-        double3 xformOp:scale = (1, 2, 1)
-        double3 xformOp:translate = (2.0797298443455805, 2, 0.9429324389820959)
-        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
-
-        def "cube" (
-            prepend payload = @../assets/cube.usda@
-        )
-        {
-            over "Cube" (
-                prepend apiSchemas = ["MaterialBindingAPI"]
-            )
-            {
-                rel material:binding = </Materials/diffuse_white>
+                rel material:binding = </Materials/mirror>
             }
         }
     }

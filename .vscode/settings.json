@@ -1,6 +1,9 @@
 {
-    "python.languageServer": "None",
+    "python.languageServer": "Default",
     "python.autoComplete.extraPaths": [
         "${workspaceFolder}/../monte_carlo"
+    ],
+    "black-formatter.args": [
+        "--line-length=87"
     ]
 }

@@ -85,7 +85,7 @@ def fresnel_metal(cos_theta_i: float, F_0: wp.vec3) -> wp.vec3:
     if cos_theta_i < 0.0:
         return wp.vec3(0.0, 0.0, 0.0)
 
-    factor = pow(1.0 - cos_theta_i, 5.0)
+    factor = wp.pow(1.0 - cos_theta_i, 5.0)
     result = wp.vec3(0.0, 0.0, 0.0)
     result.x = F_0.x + (1.0 - F_0.x) * factor
     result.y = F_0.y + (1.0 - F_0.y) * factor
@@ -94,17 +94,15 @@ def fresnel_metal(cos_theta_i: float, F_0: wp.vec3) -> wp.vec3:
 
 
 @wp.func
-def ggx_d(cos_theta_m: float, roughness: float) -> float:
+def ggx_d(h: wp.vec3, roughness: float) -> float:
     """
     GGX normal distribution function.
-    cos_theta_m is the cosine of the angle between the surface normal and the microfacet normal.
+    h is the microfacet normal, assumed to be in normal space.
     """
-    if cos_theta_m <= 0.0:
+    if h.z <= 0.0:
         return 0.0
     alpha = roughness * roughness
-    return alpha / (
-        wp.pi * wp.pow(cos_theta_m * cos_theta_m * (alpha - 1.0) + 1.0, 2.0)
-    )
+    return alpha / (wp.pi * wp.pow(h.z * h.z * (alpha - 1.0) + 1.0, 2.0))
 
 
 @wp.func
@@ -120,34 +118,34 @@ def _ggx_smith_g1(cos_theta: float, roughness: float) -> float:
 
 
 @wp.func
-def ggx_g(cos_theta_wi: float, cos_theta_wo: float, roughness: float) -> float:
+def ggx_g(wi: wp.vec3, wo: wp.vec3, roughness: float) -> float:
     """
     Smith's shadowing-masking function for GGX.
-    cos_theta_wi is the cosine of the angle between the incoming direction and the surface normal.
-    cos_theta_wo is the cosine of the angle between the outgoing direction (inverse viewing direction) and the surface normal.
+    wi is the incoming direction, assumed to be in normal space.
+    wo is the outgoing direction, assumed to be in normal space.
     """
-    return _ggx_smith_g1(cos_theta_wi, roughness) * _ggx_smith_g1(
-        cos_theta_wo, roughness
-    )
+    return _ggx_smith_g1(wi.z, roughness) * _ggx_smith_g1(wo.z, roughness)
 
 
 @wp.func
-def ggx_pdf(cos_theta_wo: float, cos_theta_m: float, roughness: float) -> float:
+def ggx_visible_normal_pdf(wo: wp.vec3, h: wp.vec3, roughness: float) -> float:
     """
-    Probability density function for the projected area of the visible microfacets.
-    cos_theta_wo is the cosine of the angle between the outgoing direction (inverse viewing direction) and the surface normal.
-    cos_theta_m is the cosine of the angle between the surface normal and the sampled microfacet normal.
+    Probability density function for the visible microfacet normals.
+    wo is the outgoing direction, assumed to be in normal space.
+    h is the microfacet normal, assumed to be in normal space.
     """
     return (
-        _ggx_smith_g1(cos_theta_wo, roughness)
-        / wp.abs(cos_theta_wo)
-        * ggx_d(cos_theta_m, roughness)
-        * wp.abs(cos_theta_m)
+        _ggx_smith_g1(wo.z, roughness)
+        / wp.abs(wo.z)
+        * ggx_d(h, roughness)
+        * wp.abs(wp.dot(wo, h))
     )
 
 
 @wp.func
-def ggx_sample(rand_state: wp.uint32, wo: wp.vec3, roughness: float) -> wp.vec3:
+def ggx_visible_normal_sample(
+    rand_state: wp.uint32, wo: wp.vec3, roughness: float
+) -> wp.vec3:
     """
     Sample a microfacet normal for the GGX distribution using Heitz's method.
     wo is the outgoing direction (inverse viewing direction) in normal space.
@@ -156,9 +154,13 @@ def ggx_sample(rand_state: wp.uint32, wo: wp.vec3, roughness: float) -> wp.vec3:
     wh = wp.normalize(wp.vec3(alpha * wo.x, alpha * wo.y, wo.z))
     if wh.z < 0.0:
         wh = -wh
-    
+
     # construct a coordinate system with wh as the z-axis
-    T1 = wp.normalize(wp.cross(wp.vec3(0.0, 0.0, 1.0), wh)) if wh.z < 0.99999 else wp.vec3(1.0, 0.0, 0.0)
+    T1 = (
+        wp.normalize(wp.cross(wp.vec3(0.0, 0.0, 1.0), wh))
+        if wh.z < 0.99999
+        else wp.vec3(1.0, 0.0, 0.0)
+    )
     T2 = wp.cross(wh, T1)
     u = concentric_disk_sample(rand_state)
 
@@ -171,6 +173,7 @@ def ggx_sample(rand_state: wp.uint32, wo: wp.vec3, roughness: float) -> wp.vec3:
     nh = wp.vec3(nh.x * alpha, nh.y * alpha, wp.max(1e-6, nh.z))
     nh = wp.normalize(nh)
     return nh
+
 
 @wp.func
 def is_perfect_lambertian(material: Material) -> wp.bool:
@@ -221,8 +224,9 @@ def mat_eval_bsdf(
         return wp.vec3(0.0, 0.0, 0.0)
 
     h = wp.normalize(wi + wo)
-    metal_f = fresnel_metal(cos_theta_wi, material.base_color) * material.metallic
-    dielectric_f = fresnel_dielectric(cos_theta_wi, material.ior) * (
+    cos_theta_h = wp.clamp(wp.dot(wo, h), 0.0, 1.0)
+    metal_f = fresnel_metal(cos_theta_h, material.base_color) * material.metallic
+    dielectric_f = fresnel_dielectric(cos_theta_h, material.ior) * (
         1.0 - material.metallic
     )
     F = wp.vec3(
@@ -230,8 +234,8 @@ def mat_eval_bsdf(
         metal_f.y + dielectric_f,
         metal_f.z + dielectric_f,
     )
-    D = ggx_d(h.z, material.roughness)
-    G = ggx_g(cos_theta_wi, cos_theta_wo, material.roughness)
+    D = ggx_d(h, material.roughness)
+    G = ggx_g(wi, wo, material.roughness)
 
     specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
     diffuse = material.base_color * (1.0 - material.metallic) / wp.pi
@@ -257,7 +261,7 @@ def mat_sample(
     elif is_perfect_mirror(material):
         return wp.vec3(-wo.x, -wo.y, wo.z)
 
-    h = ggx_sample(rand_state, wo, material.roughness)
+    h = ggx_visible_normal_sample(rand_state, wo, material.roughness)
     wi = 2.0 * wp.dot(wo, h) * h - wo
     return wi
 
@@ -284,8 +288,10 @@ def mat_pdf(
         return 0.0
 
     h = wp.normalize(wi + wo)
-    cos_theta_m = h.z
-    return ggx_pdf(wo.z, cos_theta_m, material.roughness)
+    pdf_wh = ggx_visible_normal_pdf(wo, h, material.roughness)
+    pdf_wi = pdf_wh / (4.0 * wp.abs(wp.dot(wo, h)))
+
+    return pdf_wi
 
 
 # ---------------------------------------
@@ -372,7 +378,11 @@ if __name__ == "__main__":
         "-m", "--metallic", type=float, default=0.0, help="Metallic of the material."
     )
     material_arg_parser.add_argument(
-        "-r", "--roughness", type=float, default=0.5, help="Roughness of the material."
+        "-r",
+        "--roughness",
+        type=float,
+        default=0.5,
+        help="Roughness of the material.",
     )
     material_arg_parser.add_argument(
         "-i", "--ior", type=float, default=1.5, help="IOR of the material."
@@ -526,8 +536,12 @@ if __name__ == "__main__":
         )
 
         # Count number of degenerate samples
-        degenerate_samples = np.sum(np.linalg.norm(stochastic_samples_np, axis=1) < EPSILON)
-        logger.warning(f"Number of degenerate samples: {degenerate_samples}/{args.n_samples}")
+        degenerate_samples = np.sum(
+            np.linalg.norm(stochastic_samples_np, axis=1) < EPSILON
+        )
+        logger.warning(
+            f"Number of degenerate samples: {degenerate_samples}/{args.n_samples}"
+        )
 
     # Set axis limits based on both datasets
     all_samples = (
