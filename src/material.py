@@ -20,6 +20,7 @@ __all__ = [
 ]
 
 EPSILON = 1e-6
+GGX_MIN_ALPHA = 1e-4
 
 # here we'll partially implement the metallic-roughness part of the preview surface schema
 # USD preview surface schema: https://openusd.org/dev/spec_usdpreviewsurface.html#preview-surface
@@ -95,6 +96,11 @@ def fresnel_metal(cos_theta_i: float, F_0: wp.vec3) -> wp.vec3:
 
 
 @wp.func
+def _ggx_alpha(roughness: float) -> float:
+    return wp.max(roughness * roughness, GGX_MIN_ALPHA)
+
+
+@wp.func
 def ggx_d(h: wp.vec3, roughness: float) -> float:
     """
     GGX normal distribution function.
@@ -102,20 +108,20 @@ def ggx_d(h: wp.vec3, roughness: float) -> float:
     """
     if h.z <= 0.0:
         return 0.0
-    alpha = roughness * roughness
-    return alpha / (wp.pi * wp.pow(h.z * h.z * (alpha - 1.0) + 1.0, 2.0))
+    alpha = _ggx_alpha(roughness)
+    alpha2 = alpha * alpha
+    denom = h.z * h.z * (alpha2 - 1.0) + 1.0
+    return alpha2 / (wp.pi * denom * denom)
 
 
 @wp.func
 def _ggx_smith_g1(cos_theta: float, roughness: float) -> float:
     if cos_theta <= 0.0:
         return 0.0
-    alpha = roughness * roughness
-    return (
-        2.0
-        * cos_theta
-        / (cos_theta + wp.sqrt(alpha + (1.0 - alpha) * cos_theta * cos_theta))
-    )
+    alpha = _ggx_alpha(roughness)
+    alpha2 = alpha * alpha
+    sqrt_term = wp.sqrt(alpha2 + (1.0 - alpha2) * cos_theta * cos_theta)
+    return 2.0 * cos_theta / (cos_theta + sqrt_term)
 
 
 @wp.func
@@ -135,11 +141,14 @@ def ggx_visible_normal_pdf(wo: wp.vec3, h: wp.vec3, roughness: float) -> float:
     wo is the outgoing direction, assumed to be in normal space.
     h is the microfacet normal, assumed to be in normal space.
     """
+    denom = wp.abs(wo.z)
+    if denom < EPSILON:
+        return 0.0
     return (
         _ggx_smith_g1(wo.z, roughness)
-        / wp.abs(wo.z)
         * ggx_d(h, roughness)
         * wp.abs(wp.dot(wo, h))
+        / denom
     )
 
 
@@ -151,7 +160,7 @@ def ggx_visible_normal_sample(
     Sample a microfacet normal for the GGX distribution using Heitz's method.
     wo is the outgoing direction (inverse viewing direction) in normal space.
     """
-    alpha = roughness * roughness
+    alpha = _ggx_alpha(roughness)
     wh = wp.normalize(wp.vec3(alpha * wo.x, alpha * wo.y, wo.z))
     if wh.z < 0.0:
         wh = -wh
@@ -295,7 +304,7 @@ def mat_pdf(
 
     h = wp.normalize(wi + wo)
     pdf_wh = ggx_visible_normal_pdf(wo, h, material.roughness)
-    pdf_wi = pdf_wh / (4.0 * wp.abs(wp.dot(wo, h)))
+    pdf_wi = pdf_wh / (4.0 * wp.max(wp.abs(wp.dot(wo, h)), EPSILON))
 
     return pdf_wi
 
@@ -379,9 +388,14 @@ def pdf_checker_one_iter(
     rand_seed = hash2(tid, cur_iter)
     state = wp.rand_init(rand_seed)
 
-    wi = wp.sample_unit_hemisphere_surface(state)
-    pdf = mat_pdf(material, wi, wo)
-    out_samples[tid] = pdf
+    if is_perfect_lambertian(material):
+        wi = wp.sample_unit_hemisphere_surface(state)
+        inv_sample_pdf = 2.0 * wp.pi
+    else:
+        wi = wp.sample_unit_sphere_surface(state)
+        inv_sample_pdf = 4.0 * wp.pi
+
+    out_samples[tid] = mat_pdf(material, wi, wo) * inv_sample_pdf
 
 
 if __name__ == "__main__":
@@ -436,6 +450,11 @@ if __name__ == "__main__":
         default=100,
         help="Number of iterations for PDF Monte Carlo integration.",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run in headless mode without showing any plots.",
+    )
 
     args = parser.parse_args()
 
@@ -471,6 +490,42 @@ if __name__ == "__main__":
     wo = wp.normalize(wo)
 
     # ---------------------------
+    # Run PDF Monte Carlo Integration
+    # ---------------------------
+    pdf_samples = wp.empty(args.n_samples, dtype=wp.float32, device="cuda")
+    running_integral = []
+    mean_estimate = 0.0
+    total_samples = 0
+
+    print(
+        f"Running PDF Monte Carlo integration: {args.n_samples} samples/iter, {args.n_iter} iters"
+    )
+    for iter_idx in range(args.n_iter):
+        wp.launch(
+            kernel=pdf_checker_one_iter,
+            dim=args.n_samples,
+            inputs=[m, iter_idx, wo, pdf_samples],
+        )
+
+        batch_mean = np.mean(pdf_samples.numpy())
+        mean_estimate += (batch_mean - mean_estimate) * (
+            args.n_samples / (total_samples + args.n_samples)
+        )
+        total_samples += args.n_samples
+        running_integral.append(mean_estimate)
+
+    if running_integral:
+        print(
+            f"PDF Hemisphere integral estimate: {running_integral[-1]:.6f}, expected value: 1.0, error: {abs(running_integral[-1] - 1.0):.6f}"
+        )
+    else:
+        print(f"Please ensure --n-iter is greater than 0.")
+        exit(1)
+
+    if args.headless:
+        exit(0)
+
+    # ---------------------------
     # Sample BRDF
     # ---------------------------
     # Compute grid dimensions: num_theta * num_phi should equal n_samples
@@ -504,14 +559,6 @@ if __name__ == "__main__":
     stochastic_samples_np = (
         stochastic_samples.numpy() if stochastic_samples is not None else None
     )
-
-    # ---------------------------
-    # PDF Monte Carlo Integration (running in background)
-    # ---------------------------
-    pdf_samples = wp.empty(args.n_samples, dtype=wp.float32, device="cuda")
-    running_integral = []
-    mean_pdf = 0.0
-    total_samples = 0
 
     # ---------------------------
     # Combined Visualization (3D + PDF Convergence)
@@ -598,31 +645,8 @@ if __name__ == "__main__":
     if stochastic_samples_np is not None:
         ax_3d.legend()
 
-    title_3d = f"BRDF Lobe Visualization ({args.n_samples} samples, metallic={args.metallic}, roughness={args.roughness}, ior={args.ior})"
-    if stochastic_samples_np is not None:
-        title_3d += " [Mesh + Stochastic]"
+    title_3d = f"Lobe Visualization ({args.n_samples} samples, metallic={args.metallic}, roughness={args.roughness}, ior={args.ior})"
     ax_3d.set_title(title_3d)
-
-    # ---------------------------
-    # Run PDF Monte Carlo Integration
-    # ---------------------------
-    print(
-        f"Running PDF Monte Carlo integration: {args.n_samples} samples/iter, {args.n_iter} iters"
-    )
-    for iter_idx in range(args.n_iter):
-        wp.launch(
-            kernel=pdf_checker_one_iter,
-            dim=args.n_samples,
-            inputs=[m, iter_idx, wo, pdf_samples],
-        )
-
-        batch_mean = np.mean(pdf_samples.numpy())
-        mean_pdf += (batch_mean - mean_pdf) * (
-            args.n_samples / (total_samples + args.n_samples)
-        )
-        total_samples += args.n_samples
-        mc_estimate = 2.0 * wp.pi * mean_pdf
-        running_integral.append(mc_estimate)
 
     # ---------------------------
     # Plot PDF Convergence
@@ -638,8 +662,11 @@ if __name__ == "__main__":
         y=1.0, color="r", linestyle="--", linewidth=2, label="Expected Value (1.0)"
     )
     ax_pdf.set_xlabel("Iteration", fontsize=12)
-    ax_pdf.set_ylabel("PDF Integral Estimate", fontsize=12)
-    ax_pdf.set_title("PDF Monte Carlo Integration Convergence", fontsize=12)
+    ax_pdf.set_ylabel("Integral Estimate", fontsize=12)
+    ax_pdf.set_title(
+        r"Monte Carlo Estimate of $\int_{\Omega^+} \text{pdf}(w) \ \mathrm{d}w$",
+        fontsize=12,
+    )
     ax_pdf.grid(True, alpha=0.3)
     ax_pdf.legend(fontsize=10)
     final_value = running_integral[-1]
