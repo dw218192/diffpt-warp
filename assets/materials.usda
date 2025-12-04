@@ -91,7 +91,7 @@ def Scope "Materials" (
             uniform token info:id = "UsdPreviewSurface"
             color3f inputs:diffuseColor = (0.7, 0.7, 0.7)
             float inputs:metallic = 0.0
-            float inputs:roughness = 0.6
+            float inputs:roughness = 0.7
             token outputs:surface
         }
     }

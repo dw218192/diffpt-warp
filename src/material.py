@@ -310,8 +310,23 @@ def mat_pdf(
 
 
 # ---------------------------------------
-# BRDF viewer/ debug helper
+# BSDF viewer/ debug helper
+#
+# Verification criteria:
+# 1. (implemented) PDF normalization: \int p(w) dw=1 on the claimed domain (sphere or hemisphere).
+#
+# 2. Sampling correctness:
+#   - sample() produces samples whose empirical distribution matches pdf() (via histograms / CDF tests).
+#
+# 3. (implemented) BSDF consistency & energy check:
+#   - Using sample + pdf + eval to estimate the reflectance integral via Monte Carlo integration and importance sampling.
+#
+# 4. Reciprocity check:
+#   - f_r(w_i, w_o) \approx f_r(w_o, w_i)
+#
 # ---------------------------------------
+
+
 @wp.kernel
 def gen_hemisphere_dirs(
     num_theta: int,
@@ -375,7 +390,7 @@ def sample_brdf_stochastic(
 
 
 @wp.kernel
-def pdf_checker_one_iter(
+def pdf_integral_one_iter(
     material: Material,
     cur_iter: int,
     wo: wp.vec3,
@@ -398,9 +413,34 @@ def pdf_checker_one_iter(
     out_samples[tid] = mat_pdf(material, wi, wo) * inv_sample_pdf
 
 
+@wp.kernel
+def reflectance_integral_one_iter(
+    material: Material,
+    cur_iter: int,
+    wo: wp.vec3,
+    out_samples: wp.array(dtype=wp.vec3),
+):
+    """
+    Evaluate the reflectance integral of a material.
+    This is for checking the consistency of the sampler + pdf + eval.
+    """
+    tid = wp.tid()
+    rand_seed = hash2(tid, cur_iter)
+    state = wp.rand_init(rand_seed)
+
+    wi = mat_sample(material, state, wo)
+    brdf = mat_eval_bsdf(material, wi, wo)
+    pdf = mat_pdf(material, wi, wo)
+    if pdf < EPSILON:
+        out_samples[tid] = wp.vec3(0.0, 0.0, 0.0)
+    else:
+        out_samples[tid] = brdf * wi.z / pdf
+
+
 if __name__ == "__main__":
     import argparse
     import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     import numpy as np
 
@@ -502,7 +542,7 @@ if __name__ == "__main__":
     )
     for iter_idx in range(args.n_iter):
         wp.launch(
-            kernel=pdf_checker_one_iter,
+            kernel=pdf_integral_one_iter,
             dim=args.n_samples,
             inputs=[m, iter_idx, wo, pdf_samples],
         )
@@ -514,14 +554,49 @@ if __name__ == "__main__":
         total_samples += args.n_samples
         running_integral.append(mean_estimate)
 
+    final_pdf = running_integral[-1]
+    final_pdf_error = abs(final_pdf - 1.0)
     if running_integral:
         print(
-            f"PDF Hemisphere integral estimate: {running_integral[-1]:.6f}, expected value: 1.0, error: {abs(running_integral[-1] - 1.0):.6f}"
+            f"PDF Hemisphere integral estimate: {final_pdf}, expected value: 1.0, error: {final_pdf_error:.6f}"
         )
     else:
         print(f"Please ensure --n-iter is greater than 0.")
         exit(1)
 
+    # ---------------------------
+    # Run Reflectance Integral Monte Carlo Integration
+    # ---------------------------
+    reflectance_samples = wp.empty(args.n_samples, dtype=wp.vec3, device="cuda")
+    running_reflectance = []
+    mean_reflectance = np.array([0.0, 0.0, 0.0])
+    total_samples = 0
+
+    print(
+        f"Running Reflectance Integral Monte Carlo integration: {args.n_samples} samples/iter, {args.n_iter} iters"
+    )
+    for iter_idx in range(args.n_iter):
+        wp.launch(
+            kernel=reflectance_integral_one_iter,
+            dim=args.n_samples,
+            inputs=[m, iter_idx, wo, reflectance_samples],
+        )
+
+        batch_mean = np.mean(reflectance_samples.numpy(), axis=0)
+        mean_reflectance += (batch_mean - mean_reflectance) * (
+            args.n_samples / (total_samples + args.n_samples)
+        )
+        total_samples += args.n_samples
+        running_reflectance.append(mean_reflectance.copy())
+
+    final_reflectance = running_reflectance[-1]
+    final_reflectance_error = np.abs(final_reflectance - 1.0)
+    if running_reflectance:
+        print(
+            f"Reflectance integral estimate: R={final_reflectance[0]:.6f}, G={final_reflectance[1]:.6f}, B={final_reflectance[2]:.6f}, it should be <= 1 for an energy-conserving BSDF"
+        )
+
+    # early return if in headless mode
     if args.headless:
         exit(0)
 
@@ -564,8 +639,23 @@ if __name__ == "__main__":
     # Combined Visualization (3D + PDF Convergence)
     # ---------------------------
     fig = plt.figure(figsize=(14, 6))
-    ax_3d = fig.add_subplot(121, projection="3d")
-    ax_pdf = fig.add_subplot(122)
+    gs = gridspec.GridSpec(2, 2, figure=fig)
+    ax_3d = fig.add_subplot(gs[:, 0], projection="3d")
+    ax_pdf = fig.add_subplot(gs[0, 1])
+    ax_pdf.set_xlabel("Iteration", fontsize=12)
+    ax_pdf.set_ylabel("Integral Estimate", fontsize=12)
+    ax_pdf.set_title(
+        r"Monte Carlo Estimate of $\int_{\Omega} \text{pdf}(\omega) \ \mathrm{d}\omega$",
+        fontsize=12,
+    )
+    ax_reflectance = fig.add_subplot(gs[1, 1])
+    ax_reflectance.set_title("Reflectance")
+    ax_reflectance.set_xlabel("Iteration", fontsize=12)
+    ax_reflectance.set_ylabel("Reflectance", fontsize=12)
+    ax_reflectance.set_title(
+        r"Monte Carlo Importance Sampling Estimate of $\int_{\Omega+} f_r(\omega_i, \omega_o) \cos(\theta_i) \ \mathrm{d}\omega_i$",
+        fontsize=12,
+    )
 
     def build_triangles(num_theta: int, num_phi: int) -> np.ndarray:
         tris = []
@@ -661,21 +751,50 @@ if __name__ == "__main__":
     ax_pdf.axhline(
         y=1.0, color="r", linestyle="--", linewidth=2, label="Expected Value (1.0)"
     )
-    ax_pdf.set_xlabel("Iteration", fontsize=12)
-    ax_pdf.set_ylabel("Integral Estimate", fontsize=12)
-    ax_pdf.set_title(
-        r"Monte Carlo Estimate of $\int_{\Omega^+} \text{pdf}(w) \ \mathrm{d}w$",
-        fontsize=12,
-    )
     ax_pdf.grid(True, alpha=0.3)
     ax_pdf.legend(fontsize=10)
-    final_value = running_integral[-1]
-    final_error = abs(final_value - 1.0)
     ax_pdf.text(
         0.02,
         0.98,
-        f"Final: {final_value:.6f}\nError: {final_error:.6f}\nSamples: {total_samples:,}",
+        f"Final: {final_pdf:.6f}\nError: {final_pdf_error:.6f}\nSamples: {total_samples:,}",
         transform=ax_pdf.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+    )
+
+    # ---------------------------
+    # Plot Reflectance Convergence
+    # ---------------------------
+    running_reflectance_np = np.array(running_reflectance)
+    ax_reflectance.plot(
+        np.arange(1, args.n_iter + 1),
+        running_reflectance_np[:, 0],
+        "r-",
+        linewidth=2,
+        label="R",
+    )
+    ax_reflectance.plot(
+        np.arange(1, args.n_iter + 1),
+        running_reflectance_np[:, 1],
+        "g-",
+        linewidth=2,
+        label="G",
+    )
+    ax_reflectance.plot(
+        np.arange(1, args.n_iter + 1),
+        running_reflectance_np[:, 2],
+        "b-",
+        linewidth=2,
+        label="B",
+    )
+    ax_reflectance.grid(True, alpha=0.3)
+    ax_reflectance.legend(fontsize=10)
+    ax_reflectance.text(
+        0.02,
+        0.98,
+        f"Final R: {final_reflectance[0]:.6f}\nFinal G: {final_reflectance[1]:.6f}\nFinal B: {final_reflectance[2]:.6f}\nMax Error: {np.max(final_reflectance_error):.6f}\nSamples: {total_samples:,}",
+        transform=ax_reflectance.transAxes,
         fontsize=9,
         verticalalignment="top",
         bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
