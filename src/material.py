@@ -220,28 +220,32 @@ def mat_eval_bsdf(
 
     cos_theta_wi = wi.z
     cos_theta_wo = wo.z
-    if cos_theta_wi <= 0.0 or cos_theta_wo <= 0.0:
+    if cos_theta_wi * cos_theta_wo <= 0.0:
         return wp.vec3(0.0, 0.0, 0.0)
 
     h = wp.normalize(wi + wo)
     cos_theta_h = wp.clamp(wp.dot(wo, h), 0.0, 1.0)
-    metal_f = fresnel_metal(cos_theta_h, material.base_color) * material.metallic
-    dielectric_f = fresnel_dielectric(cos_theta_h, material.ior) * (
-        1.0 - material.metallic
-    )
-    F = wp.vec3(
-        metal_f.x + dielectric_f,
-        metal_f.y + dielectric_f,
-        metal_f.z + dielectric_f,
-    )
+
+    # TODO: handle metallic parameter
+
+    # metal_f = fresnel_metal(cos_theta_h, material.base_color) * material.metallic
+    # dielectric_f = fresnel_dielectric(cos_theta_h, material.ior) * (
+    #     1.0 - material.metallic
+    # )
+    # F = wp.vec3(
+    #     metal_f.x + dielectric_f,
+    #     metal_f.y + dielectric_f,
+    #     metal_f.z + dielectric_f,
+    # )
+    F = fresnel_metal(cos_theta_h, material.base_color)
     D = ggx_d(h, material.roughness)
     G = ggx_g(wi, wo, material.roughness)
 
     specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
-    diffuse = material.base_color * (1.0 - material.metallic) / wp.pi
+    # diffuse = material.base_color * (1.0 - material.metallic) / wp.pi
 
-    return specular + diffuse
-
+    # return specular + diffuse
+    return specular
 
 @wp.func
 def mat_sample(
