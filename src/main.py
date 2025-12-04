@@ -28,6 +28,7 @@ from warp_math_utils import (
     power_heuristic,
     area_to_solid_angle,
     get_triangle_points,
+    hash3,
 )
 
 from mesh import (
@@ -223,12 +224,7 @@ def draw(
     path = path_segments[tid]
     ro = path.point
     rd = path.ray_dir
-    rand_state = wp.rand_init(
-        1469598103934665603
-        ^ (tid * 1099511628211)
-        ^ (path.depth * 1469598103934665603)
-        ^ iteration
-    )
+    rand_state = wp.rand_init(hash3(tid, path.depth, iteration))
 
     # BSDF sampling
     hit_mesh_idx, hit_normal, hit_point, hit_face_idx = scene_intersect(

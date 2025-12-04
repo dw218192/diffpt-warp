@@ -166,6 +166,26 @@ def triangle_sample_bary(rand_state: wp.uint32) -> wp.vec2:
     return wp.vec2(w1, w2)
 
 
+@wp.func
+def wang_mix(x: wp.int32) -> wp.int32:
+    x ^= x >> 16
+    x *= 0x85EBCA6B
+    x ^= x >> 13
+    x *= 0xC2B2AE35
+    x ^= x >> 16
+    return x
+
+
+@wp.func
+def hash2(x: wp.int32, y: wp.int32) -> wp.int32:
+    return wang_mix(x * 0x9E3779B9 + y)
+
+
+@wp.func
+def hash3(x: wp.int32, y: wp.int32, z: wp.int32) -> wp.int32:
+    return wang_mix(wang_mix(x * 0x9E3779B9 + y) * 0x9E3779B9 + z)
+
+
 # ---------------------------
 # Visualization
 # ---------------------------

@@ -4,6 +4,7 @@ from warp_math_utils import (
     concentric_disk_sample,
     hemisphere_sample,
     hemisphere_pdf,
+    hash2,
 )
 import logging
 
@@ -247,6 +248,7 @@ def mat_eval_bsdf(
     # return specular + diffuse
     return specular
 
+
 @wp.func
 def mat_sample(
     material: Material,
@@ -299,7 +301,7 @@ def mat_pdf(
 
 
 # ---------------------------------------
-# BRDF viewer
+# BRDF viewer/ debug helper
 # ---------------------------------------
 @wp.kernel
 def gen_hemisphere_dirs(
@@ -340,8 +342,6 @@ def sample_brdf(
 ):
     """
     Sample a BRDF for a given material and a set of hemisphere directions.
-    It's consistent with the formulation of a typical path tracer, where an outgoing direction is given,
-    and the incoming directions are sampled from the BRDF.
     """
     tid = wp.tid()
     wi = in_dirs[tid]
@@ -355,11 +355,33 @@ def sample_brdf_stochastic(
     wo: wp.vec3,  # in normal space, towards 'sensor'
     out_dirs: wp.array(dtype=wp.vec3),
 ):
+    """
+    Sample a BRDF according to the corresponding sampling method.
+    """
     tid = wp.tid()
     state = wp.rand_init(tid)
     wi = mat_sample(material, state, wo)
     brdf = mat_eval_bsdf(material, wi, wo)
     out_dirs[tid] = wi * wp.length(brdf)
+
+
+@wp.kernel
+def pdf_checker_one_iter(
+    material: Material,
+    cur_iter: int,
+    wo: wp.vec3,
+    out_samples: wp.array(dtype=wp.float32),
+):
+    """
+    Check the validity of the PDF of a material, i.e. its hemisphere integral should be 1.
+    """
+    tid = wp.tid()
+    rand_seed = hash2(tid, cur_iter)
+    state = wp.rand_init(rand_seed)
+
+    wi = wp.sample_unit_hemisphere_surface(state)
+    pdf = mat_pdf(material, wi, wo)
+    out_samples[tid] = pdf
 
 
 if __name__ == "__main__":
@@ -407,6 +429,12 @@ if __name__ == "__main__":
         "--stochastic",
         action="store_true",
         help="Use stochastic sampling to generate samples for comparison",
+    )
+    parser.add_argument(
+        "--n-iter",
+        type=int,
+        default=100,
+        help="Number of iterations for PDF Monte Carlo integration.",
     )
 
     args = parser.parse_args()
@@ -478,10 +506,19 @@ if __name__ == "__main__":
     )
 
     # ---------------------------
-    # 3D Visualization
+    # PDF Monte Carlo Integration (running in background)
     # ---------------------------
-    fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(111, projection="3d")
+    pdf_samples = wp.empty(args.n_samples, dtype=wp.float32, device="cuda")
+    running_integral = []
+    mean_pdf = 0.0
+    total_samples = 0
+
+    # ---------------------------
+    # Combined Visualization (3D + PDF Convergence)
+    # ---------------------------
+    fig = plt.figure(figsize=(14, 6))
+    ax_3d = fig.add_subplot(121, projection="3d")
+    ax_pdf = fig.add_subplot(122)
 
     def build_triangles(num_theta: int, num_phi: int) -> np.ndarray:
         tris = []
@@ -509,12 +546,12 @@ if __name__ == "__main__":
     mesh.set_cmap("viridis")
     mesh.set_clim(vmin=vals.min(), vmax=vals.max())
 
-    ax.add_collection3d(mesh)
+    ax_3d.add_collection3d(mesh)
 
     # Plot stochastic samples if provided
     if stochastic_samples_np is not None:
         # Plot sampled outgoing directions as vectors
-        ax.scatter(
+        ax_3d.scatter(
             stochastic_samples_np[:, 0],
             stochastic_samples_np[:, 1],
             stochastic_samples_np[:, 2],
@@ -526,7 +563,7 @@ if __name__ == "__main__":
 
         # Also plot the reference outgoing direction wo
         origin = np.zeros((1, 3))
-        ax.quiver(
+        ax_3d.quiver(
             origin[:, 0],
             origin[:, 1],
             origin[:, 2],
@@ -554,15 +591,68 @@ if __name__ == "__main__":
         else mesh_samples_np
     )
     max_range = np.max(np.abs(all_samples))
-    ax.set_xlim(-max_range, max_range)
-    ax.set_ylim(-max_range, max_range)
-    ax.set_zlim(0, max_range)
+    ax_3d.set_xlim(-max_range, max_range)
+    ax_3d.set_ylim(-max_range, max_range)
+    ax_3d.set_zlim(0, max_range)
 
     if stochastic_samples_np is not None:
-        ax.legend()
+        ax_3d.legend()
 
-    title = f"BRDF Lobe Visualization ({args.n_samples} samples, metallic={args.metallic}, roughness={args.roughness}, ior={args.ior})"
+    title_3d = f"BRDF Lobe Visualization ({args.n_samples} samples, metallic={args.metallic}, roughness={args.roughness}, ior={args.ior})"
     if stochastic_samples_np is not None:
-        title += " [Mesh + Stochastic]"
-    ax.set_title(title)
+        title_3d += " [Mesh + Stochastic]"
+    ax_3d.set_title(title_3d)
+
+    # ---------------------------
+    # Run PDF Monte Carlo Integration
+    # ---------------------------
+    print(
+        f"Running PDF Monte Carlo integration: {args.n_samples} samples/iter, {args.n_iter} iters"
+    )
+    for iter_idx in range(args.n_iter):
+        wp.launch(
+            kernel=pdf_checker_one_iter,
+            dim=args.n_samples,
+            inputs=[m, iter_idx, wo, pdf_samples],
+        )
+
+        batch_mean = np.mean(pdf_samples.numpy())
+        mean_pdf += (batch_mean - mean_pdf) * (
+            args.n_samples / (total_samples + args.n_samples)
+        )
+        total_samples += args.n_samples
+        mc_estimate = 2.0 * wp.pi * mean_pdf
+        running_integral.append(mc_estimate)
+
+    # ---------------------------
+    # Plot PDF Convergence
+    # ---------------------------
+    ax_pdf.plot(
+        np.arange(1, args.n_iter + 1),
+        running_integral,
+        "b-",
+        linewidth=2,
+        label="Monte Carlo Estimate",
+    )
+    ax_pdf.axhline(
+        y=1.0, color="r", linestyle="--", linewidth=2, label="Expected Value (1.0)"
+    )
+    ax_pdf.set_xlabel("Iteration", fontsize=12)
+    ax_pdf.set_ylabel("PDF Integral Estimate", fontsize=12)
+    ax_pdf.set_title("PDF Monte Carlo Integration Convergence", fontsize=12)
+    ax_pdf.grid(True, alpha=0.3)
+    ax_pdf.legend(fontsize=10)
+    final_value = running_integral[-1]
+    final_error = abs(final_value - 1.0)
+    ax_pdf.text(
+        0.02,
+        0.98,
+        f"Final: {final_value:.6f}\nError: {final_error:.6f}\nSamples: {total_samples:,}",
+        transform=ax_pdf.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+    )
+
+    plt.tight_layout()
     plt.show()
