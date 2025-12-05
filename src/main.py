@@ -12,7 +12,7 @@ https://nvidia.github.io/warp/modules/functions.html
 from dataclasses import dataclass
 import logging
 import pathlib
-
+import imageio
 import numpy as np
 from pxr import Usd, UsdGeom, UsdLux, UsdShade
 
@@ -530,7 +530,7 @@ class Renderer:
 
     def render(self):
         if self._num_iter >= self.max_iter:
-            return
+            return False
 
         with wp.ScopedTimer("render single iteration"):
             wp.launch(
@@ -588,6 +588,8 @@ class Renderer:
             )
             self._num_iter += 1
 
+        return self._num_iter < self.max_iter
+
     def get_pixels(self) -> np.ndarray:
         wp.launch(
             kernel=tonemap,
@@ -644,6 +646,12 @@ if __name__ == "__main__":
         "--max-iter", type=int, default=100, help="Maximum number of iterations."
     )
     parser.add_argument("--max-depth", type=int, default=5, help="Maximum path depth.")
+    parser.add_argument(
+        "--save-path",
+        type=pathlib.Path,
+        default=None,
+        help="Path to save the rendered image.",
+    )
 
     args = parser.parse_known_args()[0]
 
@@ -723,7 +731,17 @@ if __name__ == "__main__":
 
         # main loop
         while g_running:
-            renderer.render()
+            can_continue = renderer.render()
+            if args.save_path and not can_continue:
+                args.save_path.parent.mkdir(parents=True, exist_ok=True)
+                pixels = renderer.get_pixels()
+                pixels = pixels[::-1, ...]
+                imageio.imwrite(
+                    args.save_path.as_posix(),
+                    (pixels * 255.0).clip(0.0, 255.0).astype(np.uint8),
+                )
+                break
+
             im.set_data(renderer.get_pixels())
             im_direct_lights.set_data(renderer.get_debug_pixels())
             fig.canvas.draw()
