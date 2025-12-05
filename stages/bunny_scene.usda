@@ -7,8 +7,8 @@
                 double radius = 500
             }
             dictionary Perspective = {
-                double3 position = (-9.779987417268137, 1.0042586657893158, 9.798864013020546)
-                double3 target = (-1.462315168021881, -0.1021259764459368, -1.473417416904482)
+                double3 position = (-15.588866031690326, 8.548049555261128, 2.346460385140808)
+                double3 target = (-5.395109603512083e-8, 4.478941140821029, -3.040129596953989e-7)
             }
             dictionary Right = {
                 double3 position = (-50000, 0, 0)
@@ -18,7 +18,7 @@
                 double3 position = (0, 50000, 0)
                 double radius = 500
             }
-            string boundCamera = "/World/Camera"
+            string boundCamera = "/OmniverseKit_Persp"
         }
         dictionary metricsAssembler = {
             dictionary "/World/bunny" = {
@@ -42,11 +42,11 @@
     endTimeCode = 100
     metersPerUnit = 0.01
     startTimeCode = 0
-    timeCodesPerSecond = 60
-    upAxis = "Y"
     subLayers = [
         @../assets/materials.usda@
     ]
+    timeCodesPerSecond = 60
+    upAxis = "Y"
 )
 
 def Xform "World"
@@ -65,7 +65,7 @@ def Xform "World"
             prepend apiSchemas = ["MaterialBindingAPI"]
         )
         {
-            rel material:binding = </Materials/diffuse_white>
+            rel material:binding = </Materials/mirror>
         }
     }
 
@@ -145,7 +145,7 @@ def Xform "lights"
         float inputs:height = 3
         float inputs:intensity = 238
         float inputs:width = 3
-        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, -2.220446049250313e-16, -1, 0), (0, 1, -2.220446049250313e-16, 0), (0, 4.478941093886572, 0, 1) )
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, -2.220446049250313e-16, 1, 0), (0, -1, -2.220446049250313e-16, 0), (0, 4.478941093886572, 0, 1) )
         uniform token[] xformOpOrder = ["xformOp:transform"]
     }
 }

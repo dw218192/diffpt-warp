@@ -7,8 +7,8 @@
                 double radius = 500
             }
             dictionary Perspective = {
-                double3 position = (4.701404299579813, 8.0519060381745, 8.324662091257466)
-                double3 target = (0.4212866589617459, 7.266210579974354, 0.5547325524324247)
+                double3 position = (3.694886753304169, 2.73025634640873, 6.378278724787018)
+                double3 target = (0.8316894429819803, 7.019060157367047, -0.8990761509849712)
             }
             dictionary Right = {
                 double3 position = (-500, 0, 0)
@@ -81,7 +81,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/diffuse_green>
+                rel material:binding = </Materials/mirror>
             }
         }
     }
@@ -189,7 +189,7 @@ def Xform "lights"
         float inputs:height = 3
         float inputs:intensity = 100
         float inputs:width = 3
-        matrix4d xformOp:transform = ( (2, 0, 0, 0), (0, -4.440892098500626e-16, -2, 0), (0, 1, -2.220446049250313e-16, 0), (0, 9.99, 0, 1) )
+        matrix4d xformOp:transform = ( (2, 0, 0, 0), (0, -4.440892098500626e-16, 2, 0), (0, -1, -2.220446049250313e-16, 0), (0, 9.99, 0, 1) )
         uniform token[] xformOpOrder = ["xformOp:transform"]
     }
 }

@@ -7,8 +7,8 @@
                 double radius = 500
             }
             dictionary Perspective = {
-                double3 position = (0.18654607260285921, 5.477318124824527, 5.570777200423979)
-                double3 target = (-0.2057545086571555, 1.9309071037674999, 2.9725042566809914)
+                double3 position = (4.661665821728193, 11.070197198002576, -1.2724892986627854)
+                double3 target = (3.5918018781444516e-8, 9.989999801522917, -3.6901353528406844e-8)
             }
             dictionary Right = {
                 double3 position = (-500, 0, 0)
@@ -31,11 +31,11 @@
     defaultPrim = "geo"
     framesPerSecond = 24
     metersPerUnit = 1
-    timeCodesPerSecond = 24
-    upAxis = "Y"
     subLayers = [
         @../assets/materials.usda@
     ]
+    timeCodesPerSecond = 24
+    upAxis = "Y"
 )
 
 def Xform "geo" (
@@ -210,7 +210,7 @@ def Xform "lights"
         float inputs:height = 3
         float inputs:intensity = 238
         float inputs:width = 3
-        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, -2.220446049250313e-16, -1, 0), (0, 1, -2.220446049250313e-16, 0), (0, 9.99, 0, 1) )
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, -2.220446049250313e-16, 1, 0), (0, -1, -2.220446049250313e-16, 0), (0, 9.99, 0, 1) )
         uniform token[] xformOpOrder = ["xformOp:transform"]
     }
 }

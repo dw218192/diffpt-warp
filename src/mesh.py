@@ -21,6 +21,10 @@ class Mesh:
 def get_mesh_points_and_indices(
     mesh_geom: UsdGeom.Mesh,
 ) -> tuple[np.ndarray, np.ndarray]:
+    # https://openusd.org/release/api/usd_geom_page_front.html#UsdGeom_WindingOrder
+    # both USD and warp expect right-handed coordinate system
+    # warp uses ccw winding order for some ray intersection tests
+
     transform = get_world_transform(mesh_geom.GetPrim())
 
     # get and transform vertex positions
