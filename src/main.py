@@ -102,7 +102,6 @@ def scene_intersect(
     ro: wp.vec3,
     rd: wp.vec3,
     meshes: wp.array(dtype=Mesh),
-    min_t: float,
     max_t: float,
     back_face: bool,
 ) -> tuple[int, wp.vec3, wp.vec3, int]:
@@ -119,7 +118,7 @@ def scene_intersect(
 
     for i in range(meshes.shape[0]):
         query = wp.mesh_query_ray(meshes[i].mesh_id, ro, rd, t)
-        if query.result and query.t < t and query.t > min_t:
+        if query.result and query.t < t and query.t > 0.0:
             if not back_face and query.sign < 0.0:
                 continue
 
@@ -203,7 +202,7 @@ def is_visible(
     rd = wp.normalize(p1p2)
     origin = p1 + rd * EPSILON
     hit_mesh_idx, _, hit_point, hit_face_idx = scene_intersect(
-        origin, rd, meshes, 0.0, max_t + EPSILON, True
+        origin, rd, meshes, max_t + EPSILON, True
     )
     return hit_mesh_idx == target_mesh_idx and hit_face_idx == target_face_idx
 
@@ -215,7 +214,6 @@ def draw(
     meshes: wp.array(dtype=Mesh),
     light_indices: wp.array(dtype=int),
     materials: wp.array(dtype=Material),
-    min_t: float,
     max_t: float,
     max_depth: int,
     iteration: int,
@@ -232,7 +230,7 @@ def draw(
 
     # BSDF sampling
     hit_mesh_idx, hit_normal, hit_point, hit_face_idx = scene_intersect(
-        ro, rd, meshes, min_t, max_t, False
+        ro, rd, meshes, max_t, False
     )
 
     if hit_mesh_idx != -1:
@@ -560,8 +558,7 @@ class Renderer:
                         self.meshes,
                         self.light_indices,
                         self.materials,
-                        self.cam_params.clipping_range[0],
-                        self.cam_params.clipping_range[1],
+                        1e6,
                         self.max_depth,
                         self._num_iter,
                         self._debug_radiance_depth,

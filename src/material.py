@@ -237,24 +237,21 @@ def mat_eval_bsdf(
     cos_theta_h = wp.clamp(wp.dot(wo, h), 0.0, 1.0)
 
     # TODO: handle metallic parameter
+    # f_dielectric = fresnel_dielectric(cos_theta_h, material.ior)
+    # f_metal = fresnel_metal(cos_theta_h, material.base_color)
+    # F = wp.lerp(wp.vec3(1.0, 1.0, 1.0) * f_dielectric, f_metal, material.metallic)
+    # D = ggx_d(h, material.roughness)
+    # G = ggx_g(wi, wo, material.roughness)
 
-    # metal_f = fresnel_metal(cos_theta_h, material.base_color) * material.metallic
-    # dielectric_f = fresnel_dielectric(cos_theta_h, material.ior) * (
-    #     1.0 - material.metallic
-    # )
-    # F = wp.vec3(
-    #     metal_f.x + dielectric_f,
-    #     metal_f.y + dielectric_f,
-    #     metal_f.z + dielectric_f,
-    # )
+    # specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
+    # diffuse = material.base_color * (1.0 - material.metallic) * (1.0 - F) / wp.pi
+    # return specular + diffuse
+
     F = fresnel_metal(cos_theta_h, material.base_color)
     D = ggx_d(h, material.roughness)
     G = ggx_g(wi, wo, material.roughness)
 
     specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
-    # diffuse = material.base_color * (1.0 - material.metallic) / wp.pi
-
-    # return specular + diffuse
     return specular
 
 
@@ -793,7 +790,7 @@ if __name__ == "__main__":
     ax_reflectance.text(
         0.02,
         0.98,
-        f"Final R: {final_reflectance[0]:.6f}\nFinal G: {final_reflectance[1]:.6f}\nFinal B: {final_reflectance[2]:.6f}\nMax Error: {np.max(final_reflectance_error):.6f}\nSamples: {total_samples:,}",
+        f"Final R: {final_reflectance[0]:.6f}\nFinal G: {final_reflectance[1]:.6f}\nFinal B: {final_reflectance[2]:.6f}\nMax Diff: {np.max(final_reflectance_error):.6f}\nSamples: {total_samples:,}",
         transform=ax_reflectance.transAxes,
         fontsize=9,
         verticalalignment="top",
