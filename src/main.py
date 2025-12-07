@@ -62,39 +62,12 @@ class PathSegment:
     debug_radiance: wp.vec3  # n-bounce radiance storage for debugging purposes
 
 
-@wp.kernel
-def init_path_segments(
-    path_segments: wp.array(dtype=PathSegment),
-    path_flags: wp.array(dtype=int),
-    width: int,
-    height: int,
-    # camera
-    cam_pos: wp.vec3,
-    fov_x: float,
-    fov_y: float,
-):
-    tid = wp.tid()
-
-    x = tid % width
-    y = tid // width
-
-    # offset to the center of the pixel and normalize to [-1,1]
-    sx = 2.0 * (float(x) + 0.5) / float(width) - 1.0
-    sy = 2.0 * (float(y) + 0.5) / float(height) - 1.0
-    u = sx * wp.tan(0.5 * fov_x)
-    v = sy * wp.tan(0.5 * fov_y)
-
-    ro = cam_pos
-    rd = wp.normalize(wp.vec3(u, v, -1.0))
-
-    path_segments[tid].radiance = wp.vec3(0.0, 0.0, 0.0)
-    path_segments[tid].throughput = wp.vec3(1.0, 1.0, 1.0)
-    path_segments[tid].point = ro
-    path_segments[tid].ray_dir = rd
-    path_segments[tid].pixel_idx = tid
-    path_segments[tid].depth = 0
-    path_segments[tid].prev_bsdf_pdf = 0.0
-    path_flags[tid] = 0
+@wp.struct
+class HitData:
+    mesh_idx: int  # -1 if miss
+    face_idx: int
+    hit_point: wp.vec3
+    hit_normal: wp.vec3
 
 
 @wp.func
@@ -104,11 +77,10 @@ def scene_intersect(
     meshes: wp.array(dtype=Mesh),
     max_t: float,
     back_face: bool,
-) -> tuple[int, wp.vec3, wp.vec3, int]:
+) -> HitData:
     """
     Find the closest intersection between a ray and the scene geometries (including lights).
-    Returns the index (not warp mesh id) of the hit mesh, the normal at the hit point, the hit point, and the hit face index.
-    If no intersection is found, the hit mesh index is -1.
+    Returns the hit data.
     """
     t = wp.float32(max_t)
     hit_mesh_idx = wp.int32(-1)
@@ -128,7 +100,7 @@ def scene_intersect(
             hit_point = ro + t * rd
             hit_face_idx = query.face
 
-    return hit_mesh_idx, hit_normal, hit_point, hit_face_idx
+    return HitData(hit_mesh_idx, hit_face_idx, hit_point, hit_normal)
 
 
 @wp.func
@@ -201,24 +173,89 @@ def is_visible(
     max_t = wp.length(p1p2)
     rd = wp.normalize(p1p2)
     origin = p1 + rd * EPSILON
-    hit_mesh_idx, _, hit_point, hit_face_idx = scene_intersect(
-        origin, rd, meshes, max_t + EPSILON, True
-    )
+    hit_data = scene_intersect(origin, rd, meshes, max_t + EPSILON, True)
+    hit_mesh_idx = hit_data.mesh_idx
+    hit_face_idx = hit_data.face_idx
     return hit_mesh_idx == target_mesh_idx and hit_face_idx == target_face_idx
 
 
+# ------------------------------------------------------------------------------------------------
+# Wavefront Path Tracing kernels
+
+
 @wp.kernel
-def draw(
+def init_path_segments(
+    path_segments: wp.array(dtype=PathSegment),
+    path_flags: wp.array(dtype=int),
+    width: int,
+    height: int,
+    # camera
+    cam_pos: wp.vec3,
+    fov_x: float,
+    fov_y: float,
+):
+    """
+    Step 0: Initialize path segments with camera rays.
+    """
+    tid = wp.tid()
+
+    x = tid % width
+    y = tid // width
+
+    # offset to the center of the pixel and normalize to [-1,1]
+    sx = 2.0 * (float(x) + 0.5) / float(width) - 1.0
+    sy = 2.0 * (float(y) + 0.5) / float(height) - 1.0
+    u = sx * wp.tan(0.5 * fov_x)
+    v = sy * wp.tan(0.5 * fov_y)
+
+    ro = cam_pos
+    rd = wp.normalize(wp.vec3(u, v, -1.0))
+
+    path_segments[tid].radiance = wp.vec3(0.0, 0.0, 0.0)
+    path_segments[tid].throughput = wp.vec3(1.0, 1.0, 1.0)
+    path_segments[tid].point = ro
+    path_segments[tid].ray_dir = rd
+    path_segments[tid].pixel_idx = tid
+    path_segments[tid].depth = 0
+    path_segments[tid].prev_bsdf_pdf = 0.0
+    path_flags[tid] = 0
+
+
+@wp.kernel
+def intersect(
     path_segments: wp.array(dtype=PathSegment),
     path_flags: wp.array(dtype=int),
     meshes: wp.array(dtype=Mesh),
+    max_t: float,
+    out_hits: wp.array(dtype=HitData),
+):
+    """
+    Step 1: Intersect path segments with the scene geometries (including lights).
+    """
+    tid = wp.tid()
+    if path_flags[tid] == 1:
+        return
+    path = path_segments[tid]
+    out_hits[tid] = scene_intersect(path.point, path.ray_dir, meshes, max_t, False)
+
+
+@wp.kernel
+def shade(
+    # Read
+    hits: wp.array(dtype=HitData),
+    meshes: wp.array(dtype=Mesh),
     light_indices: wp.array(dtype=int),
     materials: wp.array(dtype=Material),
-    max_t: float,
     max_depth: int,
     iteration: int,
+    # Read/Write
+    path_segments: wp.array(dtype=PathSegment),
+    path_flags: wp.array(dtype=int),
     debug_radiance_depth: int,  # -1: no debug, 0: first bounce (direct), 1: second bounce (1-bounce lighting), etc.
 ):
+    """
+    Step 2: Shade the path segments.
+    """
     tid = wp.tid()
     if path_flags[tid] == 1:
         return
@@ -229,9 +266,11 @@ def draw(
     rand_state = wp.rand_init(hash3(tid, path.depth, iteration))
 
     # BSDF sampling
-    hit_mesh_idx, hit_normal, hit_point, hit_face_idx = scene_intersect(
-        ro, rd, meshes, max_t, False
-    )
+    hit_data = hits[tid]
+    hit_mesh_idx = hit_data.mesh_idx
+    hit_face_idx = hit_data.face_idx
+    hit_point = hit_data.hit_point
+    hit_normal = hit_data.hit_normal
 
     if hit_mesh_idx != -1:
         normal_to_world_space = get_coord_system(hit_normal)
@@ -534,6 +573,9 @@ class Renderer:
         if self._num_iter >= self.max_iter:
             return False
 
+        hits = wp.zeros(self.width * self.height, dtype=HitData, device="cuda")
+        first_hits = wp.zeros(self.width * self.height, dtype=HitData, device="cuda")
+
         with wp.ScopedTimer("render single iteration"):
             wp.launch(
                 kernel=init_path_segments,
@@ -548,19 +590,47 @@ class Renderer:
                     self.cam_params.fov_y,
                 ],
             )
-            while True:
+
+            # cache first hits
+            wp.launch(
+                kernel=intersect,
+                dim=self.width * self.height,
+                inputs=[
+                    self._path_segments,
+                    self._path_flags,
+                    self.meshes,
+                    1e6,
+                    first_hits,
+                ],
+            )
+
+            while True:  # while there are still active paths
+                if self._num_iter > 0:
+                    wp.launch(
+                        kernel=intersect,
+                        dim=self.width * self.height,
+                        inputs=[
+                            self._path_segments,
+                            self._path_flags,
+                            self.meshes,
+                            1e6,
+                            hits,
+                        ],
+                    )
+
+                current_hits = hits if self._num_iter > 0 else first_hits
                 wp.launch(
-                    kernel=draw,
+                    kernel=shade,
                     dim=self.width * self.height,
                     inputs=[
-                        self._path_segments,
-                        self._path_flags,
+                        current_hits,
                         self.meshes,
                         self.light_indices,
                         self.materials,
-                        1e6,
                         self.max_depth,
                         self._num_iter,
+                        self._path_segments,
+                        self._path_flags,
                         self._debug_radiance_depth,
                     ],
                 )
