@@ -81,7 +81,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/mirror>
+                rel material:binding = </Materials/rough_mirror>
             }
         }
     }
@@ -187,7 +187,7 @@ def Xform "lights"
     {
         color3f inputs:color = (1, 1, 1)
         float inputs:height = 3
-        float inputs:intensity = 100
+        float inputs:intensity = 10
         float inputs:width = 3
         matrix4d xformOp:transform = ( (2, 0, 0, 0), (0, -4.440892098500626e-16, 2, 0), (0, -1, -2.220446049250313e-16, 0), (0, 9.99, 0, 1) )
         uniform token[] xformOpOrder = ["xformOp:transform"]
