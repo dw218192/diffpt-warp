@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import warp as wp
 from pxr import Usd, UsdGeom, UsdShade, UsdLux
 import numpy as np
@@ -12,10 +13,16 @@ class Mesh:
     mesh_id: wp.uint64  # warp mesh id
     material_id: wp.uint64
     num_faces: wp.int32
-    surface_area: wp.float32
     is_light: wp.bool
     light_intensity: wp.float32
     light_color: wp.vec3
+
+
+@dataclass
+class MeshCreationInfo:
+    warp_mesh: wp.Mesh
+    mesh: Mesh
+    aabb: tuple[wp.vec3, wp.vec3]
 
 
 def get_mesh_points_and_indices(
@@ -63,33 +70,10 @@ def get_mesh_points_and_indices(
     return points, indices
 
 
-def compute_mesh_surface_area(
-    points: np.ndarray[np.float32], indices: np.ndarray[np.int32]
-) -> float:
-    if len(points) == 0 or len(indices) == 0:
-        logger.warning("Points or indices are empty")
-        return 0.0
-    elif len(indices) % 3 != 0:
-        logger.warning("Num of indices is not a multiple of 3: %d", len(indices))
-        return 0.0
-
-    num_faces = indices.shape[0] // 3
-    surface_area = 0.0
-    for i in range(num_faces):
-        i1 = indices[3 * i]
-        i2 = indices[3 * i + 1]
-        i3 = indices[3 * i + 2]
-        v1 = points[i1]
-        v2 = points[i2]
-        v3 = points[i3]
-        surface_area += 0.5 * np.linalg.norm(np.cross(v2 - v1, v3 - v1))
-    return surface_area
-
-
 def create_mesh_from_usd_prim(
     prim: Usd.Prim,
     mat_prim_path_to_mat_id: dict[str, int],
-) -> tuple[wp.Mesh, Mesh] | None:
+) -> MeshCreationInfo | None:
     if prim.IsA(UsdGeom.Mesh):
         mesh_geom = UsdGeom.Mesh(prim)
         is_light = prim.HasAPI(UsdLux.MeshLightAPI)
@@ -120,13 +104,13 @@ def create_mesh_from_usd_prim(
         points=wp.array(np.ascontiguousarray(points), dtype=wp.vec3),
         velocities=None,
         indices=wp.array(np.ascontiguousarray(indices), dtype=wp.int32),
+        bvh_constructor="sah",
     )
 
     assert len(indices) % 3 == 0
 
     mesh = Mesh()
     mesh.mesh_id = wp_mesh.id
-    mesh.surface_area = compute_mesh_surface_area(points, indices)
     mesh.num_faces = len(indices) // 3
     mesh.is_light = is_light
     if is_light:
@@ -151,4 +135,6 @@ def create_mesh_from_usd_prim(
         )
         mesh.material_id = wp.uint64(min(mat_prim_path_to_mat_id.values()))
 
-    return wp_mesh, mesh
+    return MeshCreationInfo(
+        wp_mesh, mesh, (wp.vec3(np.min(points)), wp.vec3(np.max(points)))
+    )

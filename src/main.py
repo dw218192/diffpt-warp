@@ -48,6 +48,9 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 EPSILON = 1e-4
+BVH_THRESHOLD = (
+    20  # if less than this number of meshes, use linear search instead of bvh
+)
 
 
 @wp.struct
@@ -72,6 +75,7 @@ class HitData:
 
 @wp.func
 def scene_intersect(
+    bvh_id: wp.uint64,
     ro: wp.vec3,
     rd: wp.vec3,
     meshes: wp.array(dtype=Mesh),
@@ -88,17 +92,35 @@ def scene_intersect(
     hit_point = wp.vec3(0.0, 0.0, 0.0)
     hit_face_idx = wp.int32(-1)
 
-    for i in range(meshes.shape[0]):
-        query = wp.mesh_query_ray(meshes[i].mesh_id, ro, rd, t)
-        if query.result and query.t < t and query.t > 0.0:
-            if not back_face and query.sign < 0.0:
-                continue
+    if bvh_id == wp.uint64(-1):
+        for i in range(meshes.shape[0]):
+            mesh_query = wp.mesh_query_ray(meshes[i].mesh_id, ro, rd, t)
+            if mesh_query.result and mesh_query.t < t and mesh_query.t > 0.0:
+                if not back_face and mesh_query.sign < 0.0:
+                    continue
 
-            t = query.t
-            hit_mesh_idx = i
-            hit_normal = query.normal
-            hit_point = ro + t * rd
-            hit_face_idx = query.face
+                t = mesh_query.t
+                hit_mesh_idx = i
+                hit_normal = mesh_query.normal
+                hit_point = ro + t * rd
+                hit_face_idx = mesh_query.face
+    else:
+        bvh_query = wp.bvh_query_ray(bvh_id, ro, rd)
+        i = wp.int32(0)
+
+        while wp.bvh_query_next(bvh_query, i):
+            # The ray intersects the volume with index i
+            mesh = meshes[i]
+            mesh_query = wp.mesh_query_ray(mesh.mesh_id, ro, rd, t)
+            if mesh_query.result and mesh_query.t < t and mesh_query.t > 0.0:
+                if not back_face and mesh_query.sign < 0.0:
+                    continue
+
+                t = mesh_query.t
+                hit_mesh_idx = i
+                hit_normal = mesh_query.normal
+                hit_point = ro + t * rd
+                hit_face_idx = mesh_query.face
 
     return HitData(hit_mesh_idx, hit_face_idx, hit_point, hit_normal)
 
@@ -160,6 +182,7 @@ def compute_light_pdf(
 
 @wp.func
 def is_visible(
+    bvh_id: wp.uint64,
     target_mesh_idx: int,
     target_face_idx: int,
     p1: wp.vec3,
@@ -173,7 +196,7 @@ def is_visible(
     max_t = wp.length(p1p2)
     rd = wp.normalize(p1p2)
     origin = p1 + rd * EPSILON
-    hit_data = scene_intersect(origin, rd, meshes, max_t + EPSILON, True)
+    hit_data = scene_intersect(bvh_id, origin, rd, meshes, max_t + EPSILON, True)
     hit_mesh_idx = hit_data.mesh_idx
     hit_face_idx = hit_data.face_idx
     return hit_mesh_idx == target_mesh_idx and hit_face_idx == target_face_idx
@@ -223,10 +246,13 @@ def init_path_segments(
 
 @wp.kernel
 def intersect(
+    # Read
+    bvh_id: wp.uint64,
     path_segments: wp.array(dtype=PathSegment),
     path_flags: wp.array(dtype=int),
     meshes: wp.array(dtype=Mesh),
     max_t: float,
+    # Write
     out_hits: wp.array(dtype=HitData),
 ):
     """
@@ -236,12 +262,15 @@ def intersect(
     if path_flags[tid] == 1:
         return
     path = path_segments[tid]
-    out_hits[tid] = scene_intersect(path.point, path.ray_dir, meshes, max_t, False)
+    out_hits[tid] = scene_intersect(
+        bvh_id, path.point, path.ray_dir, meshes, max_t, False
+    )
 
 
 @wp.kernel
 def shade(
     # Read
+    bvh_id: wp.uint64,
     hits: wp.array(dtype=HitData),
     meshes: wp.array(dtype=Mesh),
     light_indices: wp.array(dtype=int),
@@ -319,7 +348,12 @@ def shade(
             light_mesh_idx != -1
             and light_pdf_area > 0
             and is_visible(
-                light_mesh_idx, light_face_idx, hit_point, light_sample_point, meshes
+                bvh_id,
+                light_mesh_idx,
+                light_face_idx,
+                hit_point,
+                light_sample_point,
+                meshes,
             )
         ):
             wi = world_to_normal_space * wp.normalize(light_sample_point - hit_point)
@@ -456,6 +490,7 @@ class Renderer:
         usd_path: The path to the USD file to render.
         max_iter: The maximum number of iterations to run.
         max_depth: The maximum depth of the path.
+        force_bvh: Whether to force the use of a BVH.
 
     Returns:
         The rendered image.
@@ -478,6 +513,7 @@ class Renderer:
         usd_path: pathlib.Path,
         max_iter: int,
         max_depth: int,
+        force_bvh: bool,
     ):  # height will be computed from width and fov set in the USD stage's camera prim
 
         self.cam_params = CameraParams()
@@ -488,6 +524,11 @@ class Renderer:
         self.wp_meshes = []
         self.light_indices = []
         self.materials = []
+
+        # aabb values for bvh construction
+        self.bvh_lower_bounds = []
+        self.bvh_upper_bounds = []
+
         mat_prim_path_to_mat_id = {}
 
         # collect all materials
@@ -520,11 +561,24 @@ class Renderer:
                 if res is None:
                     continue
 
-                wp_mesh, mesh = res
+                wp_mesh = res.warp_mesh
+                mesh = res.mesh
+                aabb = res.aabb
+                self.bvh_lower_bounds.append(aabb[0])
+                self.bvh_upper_bounds.append(aabb[1])
                 self.wp_meshes.append(wp_mesh)
                 self.meshes.append(mesh)
                 if mesh.is_light:
                     self.light_indices.append(len(self.meshes) - 1)
+
+        if len(self.meshes) > BVH_THRESHOLD and not force_bvh:
+            self.bvh = wp.Bvh(
+                wp.array(self.bvh_lower_bounds, dtype=wp.vec3),
+                wp.array(self.bvh_upper_bounds, dtype=wp.vec3),
+                "lbvh",
+            )
+        else:
+            self.bvh = None
 
         self.width = width
         self.height = int(
@@ -569,6 +623,10 @@ class Renderer:
     def debug_radiance_depth(self, value: int):
         self._debug_radiance_depth = value
 
+    @property
+    def bvh_id(self):
+        return self.bvh.id if self.bvh else wp.uint64(-1)
+
     def render(self):
         if self._num_iter >= self.max_iter:
             return False
@@ -596,6 +654,7 @@ class Renderer:
                 kernel=intersect,
                 dim=self.width * self.height,
                 inputs=[
+                    self.bvh_id,
                     self._path_segments,
                     self._path_flags,
                     self.meshes,
@@ -610,6 +669,7 @@ class Renderer:
                         kernel=intersect,
                         dim=self.width * self.height,
                         inputs=[
+                            self.bvh_id,
                             self._path_segments,
                             self._path_flags,
                             self.meshes,
@@ -623,6 +683,7 @@ class Renderer:
                     kernel=shade,
                     dim=self.width * self.height,
                     inputs=[
+                        self.bvh_id,
                         current_hits,
                         self.meshes,
                         self.light_indices,
@@ -723,6 +784,11 @@ if __name__ == "__main__":
         default=None,
         help="Path to save the rendered image.",
     )
+    parser.add_argument(
+        "--force-bvh",
+        action="store_true",
+        help=f"Force the use of a BVH. By default, a BVH is used if the number of meshes is greater than {BVH_THRESHOLD}.",
+    )
 
     args = parser.parse_known_args()[0]
 
@@ -732,6 +798,7 @@ if __name__ == "__main__":
             usd_path=args.usd_path,
             max_iter=args.max_iter,
             max_depth=args.max_depth,
+            force_bvh=args.force_bvh,
         )
 
         plt.ion()  # turn on interactive mode
