@@ -88,8 +88,8 @@ def scene_intersect(
     """
     t = wp.float32(max_t)
     hit_mesh_idx = wp.int32(-1)
-    hit_normal = wp.vec3(0.0, 0.0, 0.0)
-    hit_point = wp.vec3(0.0, 0.0, 0.0)
+    hit_normal = wp.vec3(0.0)
+    hit_point = wp.vec3(0.0)
     hit_face_idx = wp.int32(-1)
 
     if bvh_id == wp.uint64(-1):
@@ -138,7 +138,7 @@ def light_sample(
     """
     num_lights = len(light_indices)
     if num_lights == 0:
-        return -1, -1, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0), 0.0
+        return -1, -1, wp.vec3(0.0), wp.vec3(0.0), 0.0
 
     light_idx = wp.randi(rand_state, 0, num_lights)
     light_mesh = meshes[light_indices[light_idx]]
@@ -234,7 +234,7 @@ def init_path_segments(
     ro = cam_pos
     rd = wp.normalize(wp.vec3(u, v, -1.0))
 
-    path_segments[tid].radiance = wp.vec3(0.0, 0.0, 0.0)
+    path_segments[tid].radiance = wp.vec3(0.0)
     path_segments[tid].throughput = wp.vec3(1.0, 1.0, 1.0)
     path_segments[tid].point = ro
     path_segments[tid].ray_dir = rd
@@ -383,8 +383,8 @@ def shade(
         wi = mat_sample(mat, rand_state, wo)
         pdf = mat_pdf(mat, wi, wo)
         if pdf <= 0.0 or wi.z < 0.0:
-            path.radiance = wp.vec3(0.0, 0.0, 0.0)
-            path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
+            path.radiance = wp.vec3(0.0)
+            path.debug_radiance = wp.vec3(0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -410,8 +410,8 @@ def shade(
         )
 
         if wp.randf(rand_state) > p_rr:
-            path.radiance = wp.vec3(0.0, 0.0, 0.0)
-            path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
+            path.radiance = wp.vec3(0.0)
+            path.debug_radiance = wp.vec3(0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -419,8 +419,8 @@ def shade(
         path.throughput = throughput / p_rr
         # hard stop
         if path.depth >= max_depth:
-            path.radiance = wp.vec3(0.0, 0.0, 0.0)
-            path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
+            path.radiance = wp.vec3(0.0)
+            path.debug_radiance = wp.vec3(0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -429,8 +429,8 @@ def shade(
         path.prev_bsdf_pdf = pdf
         path_segments[tid] = path
     else:
-        path.radiance = wp.vec3(0.0, 0.0, 0.0)
-        path.debug_radiance = wp.vec3(0.0, 0.0, 0.0)
+        path.radiance = wp.vec3(0.0)
+        path.debug_radiance = wp.vec3(0.0)
         path_segments[tid] = path
         path_flags[tid] = 1
 
@@ -790,7 +790,7 @@ if __name__ == "__main__":
         help=f"Force the use of a BVH. By default, a BVH is used if the number of meshes is greater than {BVH_THRESHOLD}.",
     )
 
-    args = parser.parse_known_args()[0]
+    args = parser.parse_args()
 
     with wp.ScopedDevice(args.device):
         renderer = Renderer(

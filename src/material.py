@@ -1,3 +1,5 @@
+import logging
+from typing import Any
 import warp as wp
 from pxr import UsdShade
 from warp_math_utils import (
@@ -6,7 +8,6 @@ from warp_math_utils import (
     hemisphere_pdf,
     hash2,
 )
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -65,34 +66,27 @@ def create_material_from_usd_prim(prim: UsdShade.Material):
 
 
 @wp.func
-def fresnel_dielectric(cos_theta_i: float, ior: float) -> float:
-    """
-    Schlick's approximation for the Fresnel term, assuming air-dielectric interface.
-    """
-    cos_theta_i = wp.clamp(cos_theta_i, -1.0, 1.0)
-    if cos_theta_i < 0.0:
-        ior = 1.0 / ior
-        cos_theta_i = -cos_theta_i
-    F_0 = (ior - 1.0) / (ior + 1.0)
-    F_0 = F_0 * F_0
-    return F_0 + (1.0 - F_0) * wp.pow(1.0 - cos_theta_i, 5.0)
+def same_hemisphere(wi: wp.vec3, wo: wp.vec3) -> wp.bool:
+    return wi.z * wo.z > 0.0
 
 
 @wp.func
-def fresnel_metal(cos_theta_i: float, F_0: wp.vec3) -> wp.vec3:
+def f0_dielectric(ior: float) -> float:
+    ret = (ior - 1.0) / (ior + 1.0)
+    return ret * ret
+
+
+@wp.func
+def fresnel_schlick(cos_theta_i: float, F_0: Any) -> Any:
     """
-    Fresnel term for a metallic material.
+    Fresnel term using Schlick's approximation.
     """
     cos_theta_i = wp.clamp(cos_theta_i, -1.0, 1.0)
     if cos_theta_i < 0.0:
-        return wp.vec3(0.0, 0.0, 0.0)
+        return type(F_0)(0.0)
 
     factor = wp.pow(1.0 - cos_theta_i, 5.0)
-    result = wp.vec3(0.0, 0.0, 0.0)
-    result.x = F_0.x + (1.0 - F_0.x) * factor
-    result.y = F_0.y + (1.0 - F_0.y) * factor
-    result.z = F_0.z + (1.0 - F_0.z) * factor
-    return result
+    return F_0 + (type(F_0)(1.0) - F_0) * factor
 
 
 @wp.func
@@ -186,16 +180,6 @@ def ggx_visible_normal_sample(
 
 
 @wp.func
-def is_perfect_lambertian(material: Material) -> wp.bool:
-    return material.metallic <= EPSILON and material.roughness >= 1.0 - EPSILON
-
-
-@wp.func
-def is_perfect_mirror(material: Material) -> wp.bool:
-    return material.metallic >= 1.0 - EPSILON and material.roughness <= EPSILON
-
-
-@wp.func
 def is_emissive(material: Material) -> wp.bool:
     return (
         material.emissive_color.x > EPSILON
@@ -214,45 +198,28 @@ def mat_eval_bsdf(
     Evaluate the BRDF for a given material and an incoming and outgoing direction.
     Returns the BRDF value.
     """
-
-    if is_perfect_lambertian(material):
-        return material.base_color / wp.pi
-    elif is_perfect_mirror(material):
-        if (
-            wi.z > 0.0
-            and wp.abs(wi.x + wo.x) < EPSILON
-            and wp.abs(wi.y + wo.y) < EPSILON
-            and wp.abs(wi.z - wo.z) < EPSILON
-        ):
-            return fresnel_dielectric(wi.z, material.ior) * material.base_color / wi.z
-        else:
-            return wp.vec3(0.0, 0.0, 0.0)
-
     cos_theta_wi = wi.z
     cos_theta_wo = wo.z
-    if cos_theta_wi * cos_theta_wo <= 0.0:
+    if not same_hemisphere(wi, wo):
         return wp.vec3(0.0, 0.0, 0.0)
 
     h = wp.normalize(wi + wo)
     cos_theta_h = wp.clamp(wp.dot(wo, h), 0.0, 1.0)
 
     # TODO: handle metallic parameter
-    # f_dielectric = fresnel_dielectric(cos_theta_h, material.ior)
-    # f_metal = fresnel_metal(cos_theta_h, material.base_color)
-    # F = wp.lerp(wp.vec3(1.0, 1.0, 1.0) * f_dielectric, f_metal, material.metallic)
-    # D = ggx_d(h, material.roughness)
-    # G = ggx_g(wi, wo, material.roughness)
-
-    # specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
-    # diffuse = material.base_color * (1.0 - material.metallic) * (1.0 - F) / wp.pi
-    # return specular + diffuse
-
-    F = fresnel_metal(cos_theta_h, material.base_color)
+    F0 = wp.lerp(wp.vec3(0.4), material.base_color, material.metallic)
+    F = fresnel_schlick(cos_theta_h, F0)
     D = ggx_d(h, material.roughness)
     G = ggx_g(wi, wo, material.roughness)
 
+    # fraction of light reflected (specular)
+    kS = F
+    # fraction of light refracted (diffuse), attenuated by the metallic parameter
+    kD = (wp.vec3(1.0) - kS) * (1.0 - material.metallic)
+
     specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
-    return specular
+    diffuse = wp.cw_mul(kD, material.base_color) / wp.pi
+    return specular + diffuse
 
 
 @wp.func
@@ -267,15 +234,15 @@ def mat_sample(
 
     The definition of incoming and outgoing directions is consistent with PBRT.
     """
+    prob_specular = wp.lerp(0.5, 1.0, material.metallic)
+    choice = wp.randf(rand_state)
 
-    if is_perfect_lambertian(material):
+    if choice < prob_specular:
+        h = ggx_visible_normal_sample(rand_state, wo, material.roughness)
+        # reflect wo around the sampled microfacet normal
+        return 2.0 * wp.dot(wo, h) * h - wo
+    else:
         return hemisphere_sample(rand_state)
-    elif is_perfect_mirror(material):
-        return wp.vec3(-wo.x, -wo.y, wo.z)
-
-    h = ggx_visible_normal_sample(rand_state, wo, material.roughness)
-    wi = 2.0 * wp.dot(wo, h) * h - wo
-    return wi
 
 
 @wp.func
@@ -287,23 +254,20 @@ def mat_pdf(
     """
     Evaluate the PDF of a sampled incoming direction.
     """
-
-    if is_perfect_lambertian(material):
-        return hemisphere_pdf(wi)
-    elif is_perfect_mirror(material):
-        if (
-            wp.abs(wi.x + wo.x) < EPSILON
-            and wp.abs(wi.y + wo.y) < EPSILON
-            and wp.abs(wi.z - wo.z) < EPSILON
-        ):
-            return 1.0
+    if not same_hemisphere(wi, wo):
         return 0.0
 
     h = wp.normalize(wi + wo)
+
+    prob_specular = wp.lerp(0.5, 1.0, material.metallic)
+    prob_diffuse = 1.0 - prob_specular
+
     pdf_wh = ggx_visible_normal_pdf(wo, h, material.roughness)
     pdf_wi = pdf_wh / (4.0 * wp.max(wp.abs(wp.dot(wo, h)), EPSILON))
 
-    return pdf_wi
+    pdf_diffuse = hemisphere_pdf(wi)
+
+    return prob_specular * pdf_wi + prob_diffuse * pdf_diffuse
 
 
 # ---------------------------------------
@@ -394,18 +358,13 @@ def pdf_integral_one_iter(
     out_samples: wp.array(dtype=wp.float32),
 ):
     """
-    Check the validity of the PDF of a material, i.e. its hemisphere integral should be 1.
+    Check the validity of the PDF of a material, i.e. its spherical integral should be 1.
     """
     tid = wp.tid()
     rand_seed = hash2(tid, cur_iter)
     state = wp.rand_init(rand_seed)
-
-    if is_perfect_lambertian(material):
-        wi = wp.sample_unit_hemisphere_surface(state)
-        inv_sample_pdf = 2.0 * wp.pi
-    else:
-        wi = wp.sample_unit_sphere_surface(state)
-        inv_sample_pdf = 4.0 * wp.pi
+    wi = wp.sample_unit_sphere_surface(state)
+    inv_sample_pdf = 4.0 * wp.pi
 
     out_samples[tid] = mat_pdf(material, wi, wo) * inv_sample_pdf
 
