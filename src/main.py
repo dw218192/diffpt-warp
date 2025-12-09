@@ -10,16 +10,16 @@ https://nvidia.github.io/warp/modules/functions.html
 """
 
 from dataclasses import dataclass
+import contextlib
 import logging
 import pathlib
+import time
 import imageio
 import numpy as np
 from pxr import Usd, UsdGeom, UsdLux, UsdShade
 
 import warp as wp
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.widgets import TextBox
 
 from usd_utils import extract_pos
 from warp_math_utils import (
@@ -627,6 +627,10 @@ class Renderer:
     def bvh_id(self):
         return self.bvh.id if self.bvh else wp.uint64(-1)
 
+    @property
+    def num_iter(self):
+        return self._num_iter
+
     def render(self):
         if self._num_iter >= self.max_iter:
             return False
@@ -754,6 +758,55 @@ class Renderer:
 
 g_running = True
 
+
+@contextlib.contextmanager
+def record_frame(frame_times_list):
+    info = {"elapsed": 0.0}
+    t0 = time.perf_counter()
+    yield info
+    elapsed = time.perf_counter() - t0
+    info["elapsed"] = elapsed
+    frame_times_list.append(elapsed)
+
+
+def log_frame_time_stats(frame_times, spp: int):
+    if not frame_times:
+        return
+    avg_ms = 1000.0 * sum(frame_times) / len(frame_times)
+    min_ms = 1000.0 * min(frame_times)
+    max_ms = 1000.0 * max(frame_times)
+    logger.info(
+        "Frame time stats (frames=%d, spp=%d): avg=%.2f ms, min=%.2f ms, max=%.2f ms",
+        len(frame_times),
+        spp,
+        avg_ms,
+        min_ms,
+        max_ms,
+    )
+
+
+def save_image(renderer, path_arg: pathlib.Path | None, allow_default: bool):
+    """
+    Saves the current tonemapped image. If allow_default is True and path_arg
+    is None, a default path render.png in the repo root is used. Returns the
+    resolved output path if saved, otherwise None.
+    """
+    output_path = path_arg
+    if output_path is None and allow_default:
+        output_path = (pathlib.Path(__file__).parent.parent / "render.png").resolve()
+    if output_path is None:
+        return None
+
+    pixels = renderer.get_pixels()
+    pixels = pixels[::-1, ...]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(
+        output_path.as_posix(),
+        (pixels * 255.0).clip(0.0, 255.0).astype(np.uint8),
+    )
+    logger.info(f"Saved image to {output_path}")
+    return output_path
+
 if __name__ == "__main__":
     import argparse
 
@@ -789,6 +842,11 @@ if __name__ == "__main__":
         action="store_true",
         help=f"Force the use of a BVH. By default, a BVH is used if the number of meshes is greater than {BVH_THRESHOLD}.",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without opening a window; render to completion and save the image.",
+    )
 
     args = parser.parse_args()
 
@@ -801,89 +859,69 @@ if __name__ == "__main__":
             force_bvh=args.force_bvh,
         )
 
-        plt.ion()  # turn on interactive mode
-        fig, ax = plt.subplots()
-        gs = gridspec.GridSpec(
-            1, 2, width_ratios=[2, 1], height_ratios=[1], figure=fig, wspace=0.05
-        )
+        frame_times: list[float] = []
 
-        ax = fig.add_subplot(gs[:, 0])  # big render view
-        ax_direct_lights = fig.add_subplot(gs[0, 1])
+        if args.headless:
+            logger.info("Running in headless mode (no UI).")
+            while True:
+                with record_frame(frame_times):
+                    can_continue = renderer.render()
+                if not can_continue:
+                    break
 
-        ax.set_title("PBR Renderer")
-        ax.set_axis_off()
+            save_image(renderer, args.save_path, allow_default=True)
+            log_frame_time_stats(frame_times, renderer.num_iter)
+        else:
+            plt.ion()  # turn on interactive mode
+            fig, ax = plt.subplots()
 
-        ax_direct_lights.set_title("N-bounce Radiance")
-        ax_direct_lights.set_axis_off()
+            ax.set_title("PBR Renderer")
+            ax.set_axis_off()
 
-        # --- Add TextBox widget at bottom of the figure ---
-        axbox = fig.add_axes([0.5, 0.02, 0.2, 0.05])  # [left, bottom, width, height]
-        textbox = TextBox(axbox, "Debug Radiance Depth: ", initial="-1")
+            im = ax.imshow(
+                np.zeros((renderer.height, renderer.width, 3)),
+                origin="lower",
+                interpolation="antialiased",
+                aspect="equal",
+            )
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
-        def on_submit(text):
-            try:
-                val = int(text)
-                val = max(-1, min(val, renderer.max_depth))
-                ax_direct_lights.set_title(f"{val}-bounce Radiance")
+            # add label in top-left corner
+            label = ax.text(
+                0.01,
+                0.99,
+                "Iteration: 0",
+                color="white",
+                fontsize=9,
+                ha="left",
+                va="top",
+                transform=ax.transAxes,  # coordinates relative to axes (0–1)
+            )
+            plt.show(block=False)
 
-                logger.info(f"Setting debug radiance depth to {val}")
-                renderer.debug_radiance_depth = val
-            except ValueError:
-                textbox.set_val(renderer.debug_radiance_depth)
-                logger.error(f"'{text}' is not a valid integer!")
+            def handle_close(_):
+                global g_running
+                g_running = False
 
-        textbox.on_submit(on_submit)
+            fig.canvas.mpl_connect("close_event", handle_close)
 
-        im = ax.imshow(
-            np.zeros((renderer.height, renderer.width, 3)),
-            origin="lower",
-            interpolation="antialiased",
-            aspect="equal",
-        )
-        im_direct_lights = ax_direct_lights.imshow(
-            np.zeros((renderer.height, renderer.width, 3)),
-            origin="lower",
-            interpolation="antialiased",
-            aspect="equal",
-        )
-        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            # main loop
+            while g_running:
+                with record_frame(frame_times) as info:
+                    can_continue = renderer.render()
+                frame_ms = info["elapsed"] * 1000.0
+                if args.save_path and not can_continue:
+                    save_image(renderer, args.save_path, allow_default=False)
+                    break
 
-        # add label in top-left corner
-        label = ax.text(
-            0.01,
-            0.99,
-            "Iteration: 0",
-            color="white",
-            fontsize=9,
-            ha="left",
-            va="top",
-            transform=ax.transAxes,  # coordinates relative to axes (0–1)
-        )
-        plt.show(block=False)
-
-        def handle_close(_):
-            global g_running
-            g_running = False
-
-        fig.canvas.mpl_connect("close_event", handle_close)
-
-        # main loop
-        while g_running:
-            can_continue = renderer.render()
-            if args.save_path and not can_continue:
-                args.save_path.parent.mkdir(parents=True, exist_ok=True)
-                pixels = renderer.get_pixels()
-                pixels = pixels[::-1, ...]
-                imageio.imwrite(
-                    args.save_path.as_posix(),
-                    (pixels * 255.0).clip(0.0, 255.0).astype(np.uint8),
+                im.set_data(renderer.get_pixels())
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                label.set_text(
+                    f"Iteration: {renderer.num_iter} ({frame_ms:.1f} ms)"
                 )
-                break
+                if not can_continue:
+                    break
 
-            im.set_data(renderer.get_pixels())
-            im_direct_lights.set_data(renderer.get_debug_pixels())
-            fig.canvas.draw()
-            fig.canvas.flush_events()
-            label.set_text(f"Iteration: {renderer._num_iter}")
-
-        plt.close()
+            plt.close()
+            log_frame_time_stats(frame_times, renderer.num_iter)
