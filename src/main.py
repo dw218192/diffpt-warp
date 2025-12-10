@@ -638,7 +638,8 @@ class Renderer:
         hits = wp.zeros(self.width * self.height, dtype=HitData, device="cuda")
         first_hits = wp.zeros(self.width * self.height, dtype=HitData, device="cuda")
 
-        with wp.ScopedTimer("render single iteration"):
+        with wp.ScopedTimer("render single iteration") as timer:
+            timer.extra_msg = f"iteration {self._num_iter}/{self.max_iter}"
             wp.launch(
                 kernel=init_path_segments,
                 dim=self.width * self.height,
@@ -776,8 +777,7 @@ def log_frame_time_stats(frame_times, spp: int):
     min_ms = 1000.0 * min(frame_times)
     max_ms = 1000.0 * max(frame_times)
     logger.info(
-        "Frame time stats (frames=%d, spp=%d): avg=%.2f ms, min=%.2f ms, max=%.2f ms",
-        len(frame_times),
+        "Frame time stats (spp=%d): avg=%.2f ms, min=%.2f ms, max=%.2f ms",
         spp,
         avg_ms,
         min_ms,
@@ -806,6 +806,7 @@ def save_image(renderer, path_arg: pathlib.Path | None, allow_default: bool):
     )
     logger.info(f"Saved image to {output_path}")
     return output_path
+
 
 if __name__ == "__main__":
     import argparse
@@ -917,9 +918,7 @@ if __name__ == "__main__":
                 im.set_data(renderer.get_pixels())
                 fig.canvas.draw()
                 fig.canvas.flush_events()
-                label.set_text(
-                    f"Iteration: {renderer.num_iter} ({frame_ms:.1f} ms)"
-                )
+                label.set_text(f"Iteration: {renderer.num_iter} ({frame_ms:.1f} ms)")
                 if not can_continue:
                     break
 

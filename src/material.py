@@ -21,7 +21,7 @@ __all__ = [
 ]
 
 EPSILON = 1e-6
-GGX_MIN_ALPHA = 1e-4
+GGX_MIN_ALPHA = 5e-3
 
 # here we'll partially implement the metallic-roughness part of the preview surface schema
 # USD preview surface schema: https://openusd.org/dev/spec_usdpreviewsurface.html#preview-surface
@@ -129,21 +129,19 @@ def ggx_g(wi: wp.vec3, wo: wp.vec3, roughness: float) -> float:
 
 
 @wp.func
-def ggx_visible_normal_pdf(wo: wp.vec3, h: wp.vec3, roughness: float) -> float:
+def ggx_visible_normal_pdf_wi(wo: wp.vec3, h: wp.vec3, roughness: float) -> float:
     """
-    Probability density function for the visible microfacet normals.
+    Probability density function for the visible microfacet normals;
+    A change of variables is applied so that the pdf is wrt. to wi = reflect(wo, h).
     wo is the outgoing direction, assumed to be in normal space.
     h is the microfacet normal, assumed to be in normal space.
     """
-    denom = wp.abs(wo.z)
+    if h.z <= 0.0:
+        return 0.0
+    denom = 4.0 * wp.abs(wo.z)
     if denom < EPSILON:
         return 0.0
-    return (
-        _ggx_smith_g1(wo.z, roughness)
-        * ggx_d(h, roughness)
-        * wp.abs(wp.dot(wo, h))
-        / denom
-    )
+    return _ggx_smith_g1(wo.z, roughness) * ggx_d(h, roughness) / denom
 
 
 @wp.func
@@ -203,10 +201,13 @@ def mat_eval_bsdf(
     if not same_hemisphere(wi, wo):
         return wp.vec3(0.0, 0.0, 0.0)
 
-    h = wp.normalize(wi + wo)
+    h_vec = wi + wo
+    h_len_sq = wp.dot(h_vec, h_vec)
+    if h_len_sq < EPSILON:
+        return wp.vec3(0.0, 0.0, 0.0)
+    h = h_vec * (1.0 / wp.sqrt(h_len_sq))
     cos_theta_h = wp.clamp(wp.dot(wo, h), 0.0, 1.0)
 
-    # TODO: handle metallic parameter
     F0 = wp.lerp(wp.vec3(0.4), material.base_color, material.metallic)
     F = fresnel_schlick(cos_theta_h, F0)
     D = ggx_d(h, material.roughness)
@@ -257,16 +258,17 @@ def mat_pdf(
     if not same_hemisphere(wi, wo):
         return 0.0
 
-    h = wp.normalize(wi + wo)
+    h_vec = wi + wo
+    h_len_sq = wp.dot(h_vec, h_vec)
+    if h_len_sq < EPSILON:
+        return 0.0
+    h = h_vec * (1.0 / wp.sqrt(h_len_sq))
 
     prob_specular = wp.lerp(0.5, 1.0, material.metallic)
     prob_diffuse = 1.0 - prob_specular
 
-    pdf_wh = ggx_visible_normal_pdf(wo, h, material.roughness)
-    pdf_wi = pdf_wh / (4.0 * wp.max(wp.abs(wp.dot(wo, h)), EPSILON))
-
+    pdf_wi = ggx_visible_normal_pdf_wi(wo, h, material.roughness)
     pdf_diffuse = hemisphere_pdf(wi)
-
     return prob_specular * pdf_wi + prob_diffuse * pdf_diffuse
 
 
@@ -363,10 +365,22 @@ def pdf_integral_one_iter(
     tid = wp.tid()
     rand_seed = hash2(tid, cur_iter)
     state = wp.rand_init(rand_seed)
-    wi = wp.sample_unit_sphere_surface(state)
-    inv_sample_pdf = 4.0 * wp.pi
+    # Low-roughness GGX becomes extremely peaked; mix in importance sampling
+    # only for the smoothest lobes to keep the estimator stable.
+    mix_prob = 0.5 if material.roughness < 0.2 else 0.0
+    uniform_pdf = 1.0 / (2.0 * wp.pi)
+    if wp.randf(state) < mix_prob:
+        wi = mat_sample(material, state, wo)
+    else:
+        wi = wp.sample_unit_hemisphere_surface(state)
 
-    out_samples[tid] = mat_pdf(material, wi, wo) * inv_sample_pdf
+    pdf = mat_pdf(material, wi, wo)
+    sample_pdf = mix_prob * pdf + (1.0 - mix_prob) * uniform_pdf
+
+    if sample_pdf < EPSILON or not wp.isfinite(pdf) or not wp.isfinite(sample_pdf):
+        out_samples[tid] = 0.0
+    else:
+        out_samples[tid] = pdf / sample_pdf
 
 
 @wp.kernel
