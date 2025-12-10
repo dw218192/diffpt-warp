@@ -35,6 +35,7 @@ class Material:
     ior: float  # previewSurface:ior (default 1.5)
     emissive_color: wp.vec3  # previewSurface:emissiveColor
     emissive_intensity: float  # emissiveIntensity (custom attribute)
+    opacity: float  # previewSurface:opacity
 
 
 def create_material_from_usd_prim(prim: UsdShade.Material):
@@ -56,8 +57,8 @@ def create_material_from_usd_prim(prim: UsdShade.Material):
     mat.metallic = get("metallic", 0.0)
     mat.roughness = get("roughness", 0.5)
     mat.ior = get("ior", 1.5)
-    mat.emissive_color = get("emissiveColor", wp.vec3(0.0, 0.0, 0.0))
-
+    mat.emissive_color = get("emissiveColor", wp.vec3(0.0))
+    mat.opacity = get("opacity", 1.0)
     # custom attributes
     mat.emissive_intensity = get("emissiveIntensity", 0.0)
 
@@ -198,29 +199,30 @@ def mat_eval_bsdf(
     """
     cos_theta_wi = wi.z
     cos_theta_wo = wo.z
-    if not same_hemisphere(wi, wo):
-        return wp.vec3(0.0, 0.0, 0.0)
 
-    h_vec = wi + wo
-    h_len_sq = wp.dot(h_vec, h_vec)
-    if h_len_sq < EPSILON:
-        return wp.vec3(0.0, 0.0, 0.0)
-    h = h_vec * (1.0 / wp.sqrt(h_len_sq))
-    cos_theta_h = wp.clamp(wp.dot(wo, h), 0.0, 1.0)
+    if same_hemisphere(wi, wo):
+        h_vec = wi + wo
+        h_len_sq = wp.dot(h_vec, h_vec)
+        if h_len_sq < EPSILON:
+            return wp.vec3(0.0)
+        h = h_vec * (1.0 / wp.sqrt(h_len_sq))
+        cos_theta_h = wp.clamp(wp.dot(wo, h), 0.0, 1.0)
 
-    F0 = wp.lerp(wp.vec3(0.4), material.base_color, material.metallic)
-    F = fresnel_schlick(cos_theta_h, F0)
-    D = ggx_d(h, material.roughness)
-    G = ggx_g(wi, wo, material.roughness)
+        F0 = wp.lerp(wp.vec3(0.4), material.base_color, material.metallic)
+        F = fresnel_schlick(cos_theta_h, F0)
+        D = ggx_d(h, material.roughness)
+        G = ggx_g(wi, wo, material.roughness)
 
-    # fraction of light reflected (specular)
-    kS = F
-    # fraction of light refracted (diffuse), attenuated by the metallic parameter
-    kD = (wp.vec3(1.0) - kS) * (1.0 - material.metallic)
+        # fraction of light reflected (specular)
+        kS = F
+        # fraction of light refracted (diffuse), attenuated by the metallic parameter
+        kD = (wp.vec3(1.0) - kS) * (1.0 - material.metallic)
 
-    specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
-    diffuse = wp.cw_mul(kD, material.base_color) / wp.pi
-    return specular + diffuse
+        specular = F * D * G / (4.0 * cos_theta_wi * cos_theta_wo)
+        diffuse = wp.cw_mul(kD, material.base_color) / wp.pi
+        return specular + diffuse
+    else:
+        return wp.vec3(0.0)
 
 
 @wp.func
@@ -402,7 +404,7 @@ def reflectance_integral_one_iter(
     brdf = mat_eval_bsdf(material, wi, wo)
     pdf = mat_pdf(material, wi, wo)
     if pdf < EPSILON:
-        out_samples[tid] = wp.vec3(0.0, 0.0, 0.0)
+        out_samples[tid] = wp.vec3(0.0)
     else:
         out_samples[tid] = brdf * wi.z / pdf
 
@@ -492,7 +494,7 @@ if __name__ == "__main__":
     m.roughness = args.roughness
     m.ior = args.ior
     m.base_color = wp.vec3(args.base_color[0], args.base_color[1], args.base_color[2])
-    m.emissive_color = wp.vec3(0.0, 0.0, 0.0)
+    m.emissive_color = wp.vec3(0.0)
     m.emissive_intensity = 0.0
 
     # Outgoing direction (looking straight up)

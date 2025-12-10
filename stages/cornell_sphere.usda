@@ -81,7 +81,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/rough_mirror>
+                rel material:binding = </Materials/mirror>
             }
         }
     }
@@ -175,7 +175,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/plastic_grey>
+                rel material:binding = </Materials/metal_grey>
             }
         }
     }

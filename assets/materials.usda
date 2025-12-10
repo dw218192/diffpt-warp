@@ -95,6 +95,20 @@ def Scope "Materials" (
             token outputs:surface
         }
     }
+
+    def Material "metal_grey"
+    {
+        token outputs:surface.connect = </Materials/metal_grey/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor = (0.7, 0.7, 0.7)
+            float inputs:metallic = 1.0
+            float inputs:roughness = 0.3
+            token outputs:surface
+        }
+    }
     def Material "mirror"
     {
         token outputs:surface.connect = </Materials/mirror/PreviewSurface.outputs:surface>
