@@ -7,8 +7,8 @@
                 double radius = 500
             }
             dictionary Perspective = {
-                double3 position = (3.694886753304169, 2.73025634640873, 6.378278724787018)
-                double3 target = (0.8316894429819803, 7.019060157367047, -0.8990761509849712)
+                double3 position = (1.1364575016775873, 9.080651410858401, 10.59213848393211)
+                double3 target = (0.19368651073798338, 7.205259170174631, -2.3013700966503876)
             }
             dictionary Right = {
                 double3 position = (-500, 0, 0)
@@ -157,25 +157,89 @@ def Xform "geo" (
     )
     {
         quatf xformOp:orient = (1, 0, 0, 0)
-        float3 xformOp:scale = (30, 30, 30)
+        float3 xformOp:scale = (210, 210, 210)
         double3 xformOp:scale:unitsResolve = (0.01, 0.01, 0.01)
-        double3 xformOp:translate = (-0.037912092835133415, 2.847120767227577, -4.236070109955443)
+        double3 xformOp:translate = (-2.784751072787265, 2.847120767227577, -2.741841272217779)
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
 
         def "sphere" (
             prepend payload = @../assets/sphere.usda@
         )
         {
-            quatf xformOp:orient = (1, 0, 0, 0)
-            float3 xformOp:scale = (3, 3, 3)
-            double3 xformOp:translate = (0, -3.3977100397486506, 14.736877863105654)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
-
             over "Sphere" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
                 rel material:binding = </Materials/metal_grey>
+            }
+        }
+    }
+
+    def Xform "sphere_01" (
+        kind = "component"
+    )
+    {
+        quatf xformOp:orient = (1, 0, 0, 0)
+        float3 xformOp:scale = (210, 210, 210)
+        double3 xformOp:scale:unitsResolve = (0.01, 0.01, 0.01)
+        double3 xformOp:translate = (2.0252272102123983, 2.847120767227577, -2.741841272217779)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
+
+        def "sphere" (
+            prepend payload = @../assets/sphere.usda@
+        )
+        {
+            over "Sphere" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/oxidized_metal_red>
+            }
+        }
+    }
+
+    def Xform "sphere_02" (
+        kind = "component"
+    )
+    {
+        quatf xformOp:orient = (1, 0, 0, 0)
+        float3 xformOp:scale = (210, 210, 210)
+        double3 xformOp:scale:unitsResolve = (0.01, 0.01, 0.01)
+        double3 xformOp:translate = (-2.472583025831076, 7.205259148491889, -2.5799878426464824)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
+
+        def "sphere" (
+            prepend payload = @../assets/sphere.usda@
+        )
+        {
+            over "Sphere" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/plastic_grey>
+            }
+        }
+    }
+
+    def Xform "sphere_03" (
+        kind = "component"
+    )
+    {
+        quatf xformOp:orient = (1, 0, 0, 0)
+        float3 xformOp:scale = (210, 210, 210)
+        double3 xformOp:scale:unitsResolve = (0.01, 0.01, 0.01)
+        double3 xformOp:translate = (2.023034013628957, 7.205259148491889, -2.5799878426464824)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
+
+        def "sphere" (
+            prepend payload = @../assets/sphere.usda@
+        )
+        {
+            over "Sphere" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/rough_metal_yellow>
             }
         }
     }
