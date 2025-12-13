@@ -208,7 +208,11 @@ def mat_eval_bsdf(
         h = h_vec * (1.0 / wp.sqrt(h_len_sq))
         cos_theta_h = wp.clamp(wp.dot(wo, h), 0.0, 1.0)
 
-        F0 = wp.lerp(wp.vec3(0.4), material.base_color, material.metallic)
+        F0 = wp.lerp(
+            wp.vec3(f0_dielectric(material.ior)),
+            material.base_color,
+            material.metallic,
+        )
         F = fresnel_schlick(cos_theta_h, F0)
         D = ggx_d(h, material.roughness)
         G = ggx_g(wi, wo, material.roughness)
