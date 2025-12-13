@@ -62,7 +62,6 @@ class PathSegment:
     pixel_idx: int  # associated pixel index
     depth: int  # current path depth
     prev_bsdf_pdf: float  # previous BSDF PDF, used by MIS for indirect paths
-    debug_radiance: wp.vec3  # n-bounce radiance storage for debugging purposes
 
 
 @wp.struct
@@ -280,7 +279,6 @@ def shade(
     # Read/Write
     path_segments: wp.array(dtype=PathSegment),
     path_flags: wp.array(dtype=int),
-    debug_radiance_depth: int,  # -1: no debug, 0: first bounce (direct), 1: second bounce (1-bounce lighting), etc.
 ):
     """
     Step 2: Shade the path segments.
@@ -329,9 +327,6 @@ def shade(
             )
             path.radiance += mis_weight * contrib
 
-            if path.depth == debug_radiance_depth:
-                path.debug_radiance += contrib
-
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -376,15 +371,11 @@ def shade(
 
                 path.radiance += mis_weight * contrib
 
-                if path.depth == debug_radiance_depth - 1:
-                    path.debug_radiance += mis_weight * contrib
-
         # BSDF sampling
         wi = mat_sample(mat, rand_state, wo)
         pdf = mat_pdf(mat, wi, wo)
         if pdf <= 0.0 or wi.z < 0.0:
             path.radiance = wp.vec3(0.0)
-            path.debug_radiance = wp.vec3(0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -411,7 +402,6 @@ def shade(
 
         if wp.randf(rand_state) > p_rr:
             path.radiance = wp.vec3(0.0)
-            path.debug_radiance = wp.vec3(0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -420,7 +410,6 @@ def shade(
         # hard stop
         if path.depth >= max_depth:
             path.radiance = wp.vec3(0.0)
-            path.debug_radiance = wp.vec3(0.0)
             path_segments[tid] = path
             path_flags[tid] = 1
             return
@@ -430,7 +419,6 @@ def shade(
         path_segments[tid] = path
     else:
         path.radiance = wp.vec3(0.0)
-        path.debug_radiance = wp.vec3(0.0)
         path_segments[tid] = path
         path_flags[tid] = 1
 
@@ -440,7 +428,6 @@ def shade(
 def accumulate(
     path_segments: wp.array(dtype=PathSegment),
     radiances: wp.array(dtype=wp.vec3),
-    debug_radiances: wp.array(dtype=wp.vec3),
     iteration: int,
 ):
     tid = wp.tid()
@@ -448,9 +435,6 @@ def accumulate(
     pixel_idx = path_segments[tid].pixel_idx
     radiances[pixel_idx] += (
         path_segments[tid].radiance - radiances[pixel_idx]
-    ) / float(num_samples)
-    debug_radiances[pixel_idx] += (
-        path_segments[tid].debug_radiance - debug_radiances[pixel_idx]
     ) / float(num_samples)
 
 
@@ -597,8 +581,6 @@ class Renderer:
 
         # stores the running estimates of the radiances for each pixel
         self.radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
-        # stores the running estimates of debug radiances (n-th term of the Neumann series representation of the rendering equation)
-        self.debug_radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
 
         self.meshes = wp.array(self.meshes, dtype=Mesh)
         self.materials = wp.array(self.materials, dtype=Material)
@@ -606,22 +588,11 @@ class Renderer:
         self.max_iter = max_iter
         self.max_depth = max_depth
 
-        self._debug_radiance_depth = -1
-        self._last_debug_radiance_depth = -1
-
         self._num_iter = 0
         self._path_segments = wp.zeros(
             self.width * self.height, dtype=PathSegment, device="cuda"
         )
         self._path_flags = wp.zeros(self.width * self.height, dtype=int, device="cuda")
-
-    @property
-    def debug_radiance_depth(self):
-        return self._debug_radiance_depth
-
-    @debug_radiance_depth.setter
-    def debug_radiance_depth(self, value: int):
-        self._debug_radiance_depth = value
 
     @property
     def bvh_id(self):
@@ -697,7 +668,6 @@ class Renderer:
                         self._num_iter,
                         self._path_segments,
                         self._path_flags,
-                        self._debug_radiance_depth,
                     ],
                 )
                 host_path_flags = self._path_flags.numpy()
@@ -709,17 +679,12 @@ class Renderer:
                 if not should_continue:
                     break
 
-            if self._last_debug_radiance_depth != self._debug_radiance_depth:
-                self.debug_radiances.zero_()
-                self._last_debug_radiance_depth = self._debug_radiance_depth
-
             wp.launch(
                 kernel=accumulate,
                 dim=self.width * self.height,
                 inputs=[
                     self._path_segments,
                     self.radiances,
-                    self.debug_radiances,
                     self._num_iter,
                 ],
             )
@@ -738,23 +703,9 @@ class Renderer:
         )
         return self.dev_pixels.numpy().reshape((self.height, self.width, 3))
 
-    def get_debug_pixels(self) -> np.ndarray:
-        wp.launch(
-            kernel=tonemap,
-            dim=self.width * self.height,
-            inputs=[
-                self.debug_radiances,
-                self.dev_pixels,
-            ],
-        )
-        return self.dev_pixels.numpy().reshape((self.height, self.width, 3))
-
     def reset(self):
         self._num_iter = 0
-        self._last_debug_radiance_depth = -1
-        self._debug_radiance_depth = -1
         self.radiances.zero_()
-        self.debug_radiances.zero_()
 
 
 g_running = True
