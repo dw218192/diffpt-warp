@@ -9,17 +9,18 @@ Techniques:
 https://nvidia.github.io/warp/modules/functions.html
 """
 
-from dataclasses import dataclass
 import contextlib
+from dataclasses import dataclass
 import logging
 import pathlib
 import time
-import imageio
+import imageio.v2 as imageio
 import numpy as np
-from pxr import Usd, UsdGeom, UsdLux, UsdShade
+from pxr import Usd, UsdGeom, UsdShade
 
 import warp as wp
 import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 
 from usd_utils import extract_pos
 from warp_math_utils import (
@@ -43,6 +44,7 @@ from material import (
     mat_sample,
     mat_pdf,
 )
+from learning import LearningSession
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -53,15 +55,50 @@ BVH_THRESHOLD = (
 )
 
 
+# per-pixel
 @wp.struct
 class PathSegment:
-    radiance: wp.vec3  # estimated radiance
-    throughput: wp.vec3  # current throughput of the path
     point: wp.vec3  # current hit point
     ray_dir: wp.vec3  # current ray direction
     pixel_idx: int  # associated pixel index
-    depth: int  # current path depth
+    depth: int  # current path depth, -1 if terminated
     prev_bsdf_pdf: float  # previous BSDF PDF, used by MIS for indirect paths
+    throughput: wp.vec3  # current throughput
+    radiance: wp.vec3  # current radiance
+
+
+# per-pixel
+@wp.struct
+class ReplayPathData:
+    pixel_idx: int  # associated pixel index
+    path_len: int  # length of the path, 0 if invalid
+    terminal_contrib: wp.vec3  # contribution at terminal light-hit
+
+
+# per-depth/bounce
+# i-th bounce data is logically stored at bounce_data[tid, i - 1]
+@wp.struct
+class ReplayBounceData:
+    hit_mat_id: int
+    wo_local: wp.vec3
+
+    # BSDF-sampled continuation
+    wi_bsdf_local: wp.vec3
+    pdf_bsdf: float
+    throughput_before: wp.vec3
+
+    # NEE (optional per bounce)
+    nee_valid: int
+    wi_nee_local: wp.vec3
+    light_pdf_solid_angle: float
+    mis_w_nee: float
+    Le_nee: wp.vec3  # light emission at sampled light (rgb)
+
+    # emissive add at surface after throughput update (optional)
+    add_emissive: int  # 1 if is_emissive(mat) was applied in forward
+
+    # russian roulette
+    inv_p_rr: float  # 1.0 / p_rr
 
 
 @wp.struct
@@ -207,14 +244,14 @@ def is_visible(
 
 @wp.kernel
 def init_path_segments(
-    path_segments: wp.array(dtype=PathSegment),
-    path_flags: wp.array(dtype=int),
+    # Read
     width: int,
     height: int,
-    # camera
     cam_pos: wp.vec3,
     fov_x: float,
     fov_y: float,
+    # Write
+    path_segments: wp.array(dtype=PathSegment),
 ):
     """
     Step 0: Initialize path segments with camera rays.
@@ -233,14 +270,13 @@ def init_path_segments(
     ro = cam_pos
     rd = wp.normalize(wp.vec3(u, v, -1.0))
 
-    path_segments[tid].radiance = wp.vec3(0.0)
-    path_segments[tid].throughput = wp.vec3(1.0, 1.0, 1.0)
     path_segments[tid].point = ro
     path_segments[tid].ray_dir = rd
     path_segments[tid].pixel_idx = tid
     path_segments[tid].depth = 0
     path_segments[tid].prev_bsdf_pdf = 0.0
-    path_flags[tid] = 0
+    path_segments[tid].throughput = wp.vec3(1.0)
+    path_segments[tid].radiance = wp.vec3(0.0)
 
 
 @wp.kernel
@@ -248,7 +284,6 @@ def intersect(
     # Read
     bvh_id: wp.uint64,
     path_segments: wp.array(dtype=PathSegment),
-    path_flags: wp.array(dtype=int),
     meshes: wp.array(dtype=Mesh),
     max_t: float,
     # Write
@@ -258,7 +293,7 @@ def intersect(
     Step 1: Intersect path segments with the scene geometries (including lights).
     """
     tid = wp.tid()
-    if path_flags[tid] == 1:
+    if path_segments[tid].depth == -1:
         return
     path = path_segments[tid]
     out_hits[tid] = scene_intersect(
@@ -269,6 +304,7 @@ def intersect(
 @wp.kernel
 def shade(
     # Read
+    record_path_replay_data: bool,
     bvh_id: wp.uint64,
     hits: wp.array(dtype=HitData),
     meshes: wp.array(dtype=Mesh),
@@ -278,26 +314,33 @@ def shade(
     iteration: int,
     # Read/Write
     path_segments: wp.array(dtype=PathSegment),
-    path_flags: wp.array(dtype=int),
+    num_finished_paths: wp.array(dtype=int),
+    # dummy value if not recording replay data
+    # if replay_bounce_data is true, they are expected to be of correct shapes
+    replay_bounce_data: wp.array(dtype=ReplayBounceData),
+    replay_path_data: wp.array(dtype=ReplayPathData),
 ):
     """
     Step 2: Shade the path segments.
     """
     tid = wp.tid()
-    if path_flags[tid] == 1:
+    path = path_segments[tid]
+    if path.depth == -1:
         return
 
-    path = path_segments[tid]
     ro = path.point
     rd = path.ray_dir
     rand_state = wp.rand_init(hash3(tid, path.depth, iteration))
+    radiance = path.radiance
+    throughput = path.throughput
 
-    # BSDF sampling
     hit_data = hits[tid]
     hit_mesh_idx = hit_data.mesh_idx
     hit_face_idx = hit_data.face_idx
     hit_point = hit_data.hit_point
     hit_normal = hit_data.hit_normal
+
+    replay_bounce_data_idx = tid * max_depth + path.depth
 
     if hit_mesh_idx != -1:
         normal_to_world_space = get_coord_system(hit_normal)
@@ -322,13 +365,26 @@ def shade(
                 # if depth is 0, this is a direct lighting path (P_bsdf = 0.0)
                 mis_weight = 1.0
 
-            contrib = wp.cw_mul(
-                path.throughput, mesh.light_color * mesh.light_intensity
+            contrib = mis_weight * wp.cw_mul(
+                throughput, mesh.light_color * mesh.light_intensity
             )
-            path.radiance += mis_weight * contrib
+            radiance += contrib
 
+            # finalize replay data for terminal light hit
+            if record_path_replay_data:
+                path_data = replay_path_data[tid]
+                path_data.terminal_contrib = contrib
+                path_data.pixel_idx = path.pixel_idx
+                path_data.path_len = path.depth + 1
+                replay_path_data[tid] = path_data
+
+            path.radiance = radiance
+            path.throughput = throughput
+            path.depth = -1
             path_segments[tid] = path
-            path_flags[tid] = 1
+
+            wp.atomic_add(num_finished_paths, 0, 1)
+
             return
 
         # Light sampling (NEE) (1 Light sample)
@@ -362,85 +418,206 @@ def shade(
                 light_mesh = meshes[light_mesh_idx]
 
                 contrib = wp.cw_mul(
-                    path.throughput,
+                    throughput,
                     mat_eval_bsdf(mat, wi, wo) * wi.z / light_pdf_solid_angle,
                 )
 
                 Le = light_mesh.light_intensity * light_mesh.light_color
                 contrib = wp.cw_mul(contrib, Le)
 
-                path.radiance += mis_weight * contrib
+                radiance += mis_weight * contrib
+
+                # record NEE contribution for replay
+                if record_path_replay_data:
+                    bounce_data = replay_bounce_data[replay_bounce_data_idx]
+                    bounce_data.nee_valid = 1
+                    bounce_data.wi_nee_local = wi
+                    bounce_data.light_pdf_solid_angle = light_pdf_solid_angle
+                    bounce_data.mis_w_nee = mis_weight
+                    bounce_data.Le_nee = Le
+                    replay_bounce_data[replay_bounce_data_idx] = bounce_data
 
         # BSDF sampling
         wi = mat_sample(mat, rand_state, wo)
         pdf = mat_pdf(mat, wi, wo)
         if pdf <= 0.0 or wi.z < 0.0:
             path.radiance = wp.vec3(0.0)
+            path.throughput = wp.vec3(1.0)
+            path.depth = -1
             path_segments[tid] = path
-            path_flags[tid] = 1
+            wp.atomic_add(num_finished_paths, 0, 1)
+
+            # invalidate replay data
+            if record_path_replay_data:
+                replay_path_data[tid].path_len = 0
+
             return
+
+        # record bsdf continuation for replay
+        if record_path_replay_data:
+            bounce_data = replay_bounce_data[replay_bounce_data_idx]
+            bounce_data.wi_bsdf_local = wi
+            bounce_data.pdf_bsdf = pdf
+            bounce_data.throughput_before = throughput
+            replay_bounce_data[replay_bounce_data_idx] = bounce_data
 
         path.point = hit_point + hit_normal * EPSILON
         path.ray_dir = normal_to_world_space * wi
-        path.throughput = wp.cw_mul(
-            path.throughput,
-            mat_eval_bsdf(mat, wi, wo) * wi.z / pdf,
-        )
+        throughput = wp.cw_mul(throughput, mat_eval_bsdf(mat, wi, wo) * wi.z / pdf)
 
         if is_emissive(mat):
-            path.radiance += wp.cw_mul(
-                path.throughput, mat.emissive_color * mat.emissive_intensity
+            radiance += wp.cw_mul(
+                throughput, mat.emissive_color * mat.emissive_intensity
             )
 
-        path.depth += 1
+            # record emissive contribution for replay
+            if record_path_replay_data:
+                bounce_data = replay_bounce_data[replay_bounce_data_idx]
+                bounce_data.add_emissive = 1
+                replay_bounce_data[replay_bounce_data_idx] = bounce_data
+
         # russain roulette
         # the brighter the path, the higher the chance of its survival
-        throughput = path.throughput
         p_rr = wp.clamp(
             wp.max(throughput.x, wp.max(throughput.y, throughput.z)), 0.22, 1.0
         )
 
         if wp.randf(rand_state) > p_rr:
-            path.radiance = wp.vec3(0.0)
-            path_segments[tid] = path
-            path_flags[tid] = 1
+            radiance = wp.vec3(0.0)
+            path.radiance = radiance
+            path.throughput = throughput
+            path.depth = -1
+            wp.atomic_add(num_finished_paths, 0, 1)
+
+            # invalidate replay data
+            if record_path_replay_data:
+                replay_path_data[tid].path_len = 0
+
             return
 
-        path.throughput = throughput / p_rr
+        inv_p_rr = 1.0 / p_rr
+
+        # record russian roulette for replay
+        if record_path_replay_data:
+            bounce_data = replay_bounce_data[replay_bounce_data_idx]
+            bounce_data.inv_p_rr = inv_p_rr
+            replay_bounce_data[replay_bounce_data_idx] = bounce_data
+
+        throughput = throughput * inv_p_rr
+
         # hard stop
-        if path.depth >= max_depth:
-            path.radiance = wp.vec3(0.0)
+        if path.depth == max_depth - 1:
+            radiance = wp.vec3(0.0)
+            path.radiance = radiance
+            path.throughput = throughput
+            path.depth = -1
             path_segments[tid] = path
-            path_flags[tid] = 1
+            wp.atomic_add(num_finished_paths, 0, 1)
+
+            # invalidate replay data
+            if record_path_replay_data:
+                replay_path_data[tid].path_len = 0
+
             return
 
         # cache the BSDF PDF
         path.prev_bsdf_pdf = pdf
+        path.radiance = radiance
+        path.throughput = throughput
+        path.depth = path.depth + 1
         path_segments[tid] = path
     else:
         path.radiance = wp.vec3(0.0)
+        path.throughput = wp.vec3(1.0)
+        path.depth = -1
         path_segments[tid] = path
-        path_flags[tid] = 1
+        wp.atomic_add(num_finished_paths, 0, 1)
+
+
+@wp.kernel
+def replay_path(
+    # Read
+    max_depth: int,
+    replay_bounce_data: wp.array(dtype=ReplayBounceData),
+    replay_path_data: wp.array(dtype=ReplayPathData),
+    materials: wp.array(dtype=Material),
+    # Write
+    out_radiance: wp.array(dtype=wp.vec3),
+):
+    """
+    Replays the path through the recorded bounce data to approximate gradients with respect to material parameters.
+    """
+    tid = wp.tid()
+    radiance = wp.vec3(0.0)
+    throughput = wp.vec3(1.0)
+
+    path_data = replay_path_data[tid]
+    if path_data.path_len <= 0:
+        out_radiance[tid] = wp.vec3(0.0)
+        return
+
+    for d in range(path_data.path_len - 1):
+        rec = replay_bounce_data[tid * max_depth + d]
+
+        mat = materials[rec.hit_mat_id]
+        wo = rec.wo_local
+
+        # --- NEE term at this bounce (if recorded) ---
+        if rec.nee_valid != 0:
+            wiL = rec.wi_nee_local
+            # replay same estimator form as shade():
+            # contrib = throughput_before * (bsdf * cos / light_pdf_solid_angle) * Le * mis_w
+            fL = mat_eval_bsdf(mat, wiL, wo)
+            cL = wp.cw_mul(
+                rec.throughput_before, fL * wiL.z / rec.light_pdf_solid_angle
+            )
+            cL = wp.cw_mul(cL, rec.Le_nee)
+            radiance += rec.mis_w_nee * cL
+
+        # --- BSDF continuation throughput update ---
+        wi = rec.wi_bsdf_local
+        pdf = rec.pdf_bsdf
+
+        if pdf <= 0.0 or wi.z <= 0.0:
+            out_radiance[tid] = wp.vec3(0.0)
+            return
+
+        f = mat_eval_bsdf(mat, wi, wo)
+        throughput = wp.cw_mul(rec.throughput_before, f * wi.z / pdf)
+
+        if rec.add_emissive != 0:
+            radiance += wp.cw_mul(
+                throughput, mat.emissive_color * mat.emissive_intensity
+            )
+
+        throughput = throughput * rec.inv_p_rr
+
+    # --- Terminal mesh-light hit contribution ---
+    radiance += path_data.terminal_contrib
+    out_radiance[path_data.pixel_idx] = radiance
 
 
 # monte carlo integration
 @wp.kernel
 def accumulate(
+    # Read
+    num_samples: int,
     path_segments: wp.array(dtype=PathSegment),
-    radiances: wp.array(dtype=wp.vec3),
-    iteration: int,
+    # Write
+    radiance_sum: wp.array(dtype=wp.vec3),
+    radiance: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
-    num_samples = iteration + 1
     pixel_idx = path_segments[tid].pixel_idx
-    radiances[pixel_idx] += (
-        path_segments[tid].radiance - radiances[pixel_idx]
-    ) / float(num_samples)
+    radiance_sum[pixel_idx] += path_segments[tid].radiance
+    radiance[pixel_idx] = radiance_sum[pixel_idx] / float(num_samples)
 
 
 @wp.kernel
 def tonemap(
+    # Read
     radiances: wp.array(dtype=wp.vec3),
+    # Write
     pixels: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
@@ -451,9 +628,9 @@ def tonemap(
 
     # gamma correction
     p = 0.45454545454  # 1/2.2
-    pixel[0] = wp.clamp(wp.pow(pixel[0], p), 0.0, 1.0)
-    pixel[1] = wp.clamp(wp.pow(pixel[1], p), 0.0, 1.0)
-    pixel[2] = wp.clamp(wp.pow(pixel[2], p), 0.0, 1.0)
+    pixel[0] = wp.clamp(wp.pow(wp.max(pixel[0], EPSILON), p), 0.0, 1.0)
+    pixel[1] = wp.clamp(wp.pow(wp.max(pixel[1], EPSILON), p), 0.0, 1.0)
+    pixel[2] = wp.clamp(wp.pow(wp.max(pixel[2], EPSILON), p), 0.0, 1.0)
     pixels[tid] = pixel
 
 
@@ -466,13 +643,19 @@ class CameraParams:
 
 
 class Renderer:
+    @dataclass
+    class ReplayData:
+        is_valid: bool
+        bounce_data: wp.array(dtype=ReplayBounceData)
+        path_data: wp.array(dtype=ReplayPathData)
+
     """
     Simple USD-based path tracer.
 
     Args:
         width: The width of the output image in pixels.
         usd_path: The path to the USD file to render.
-        max_iter: The maximum number of iterations to run.
+        spp: The number of samples per pixel.
         max_depth: The maximum depth of the path.
         force_bvh: Whether to force the use of a BVH.
 
@@ -495,12 +678,13 @@ class Renderer:
         self,
         width: int,
         usd_path: pathlib.Path,
-        max_iter: int,
+        spp: int,
         max_depth: int,
         force_bvh: bool,
     ):  # height will be computed from width and fov set in the USD stage's camera prim
 
         self.cam_params = CameraParams()
+        self.usd_path = usd_path.resolve()
 
         asset_stage: Usd.Stage = Usd.Stage.Open(usd_path.as_posix())
 
@@ -555,7 +739,7 @@ class Renderer:
                 if mesh.is_light:
                     self.light_indices.append(len(self.meshes) - 1)
 
-        if len(self.meshes) > BVH_THRESHOLD and not force_bvh:
+        if len(self.meshes) > BVH_THRESHOLD or force_bvh:
             self.bvh = wp.Bvh(
                 wp.array(self.bvh_lower_bounds, dtype=wp.vec3),
                 wp.array(self.bvh_upper_bounds, dtype=wp.vec3),
@@ -570,10 +754,6 @@ class Renderer:
             * np.tan(self.cam_params.fov_y * 0.5)
             / np.tan(self.cam_params.fov_x * 0.5)
         )
-        self.dev_pixels = wp.zeros(
-            self.width * self.height, dtype=wp.vec3, device="cuda"
-        )
-
         logger.info(f"Using Camera Params: {self.cam_params}")
         logger.info(
             f"Loaded {len(self.meshes)} meshes ({len(self.light_indices)} lights)"
@@ -581,18 +761,19 @@ class Renderer:
 
         # stores the running estimates of the radiances for each pixel
         self.radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
+        self.radiance_sum = wp.zeros(self.width * self.height, dtype=wp.vec3)
 
         self.meshes = wp.array(self.meshes, dtype=Mesh)
         self.materials = wp.array(self.materials, dtype=Material)
         self.light_indices = wp.array(self.light_indices, dtype=int)
-        self.max_iter = max_iter
+        self.max_iter = spp
         self.max_depth = max_depth
 
         self._num_iter = 0
-        self._path_segments = wp.zeros(
-            self.width * self.height, dtype=PathSegment, device="cuda"
-        )
-        self._path_flags = wp.zeros(self.width * self.height, dtype=int, device="cuda")
+        self._path_segments = wp.zeros(self.width * self.height, dtype=PathSegment)
+        self._num_finished_paths = wp.zeros(1, dtype=int)
+        self._hits = wp.zeros(self.width * self.height, dtype=HitData)
+        self._first_hits = wp.zeros_like(self._hits)
 
     @property
     def bvh_id(self):
@@ -602,63 +783,82 @@ class Renderer:
     def num_iter(self):
         return self._num_iter
 
-    def render(self):
+    def render(self, record_path_replay_data: bool = False):
+        """
+        Render a single iteration of the path tracer.
+        If record_path_replay_data is True, extra data will be recorded to allow path replay backpropagation.
+        """
         if self._num_iter >= self.max_iter:
             return False
 
-        hits = wp.zeros(self.width * self.height, dtype=HitData, device="cuda")
-        first_hits = wp.zeros(self.width * self.height, dtype=HitData, device="cuda")
+        if record_path_replay_data:
+            replay_data = self.ReplayData(
+                is_valid=True,
+                bounce_data=wp.zeros(
+                    self.width * self.height * self.max_depth, dtype=ReplayBounceData
+                ),
+                path_data=wp.zeros(self.width * self.height, dtype=ReplayPathData),
+            )
+        else:
+            replay_data = self.ReplayData(
+                is_valid=False,
+                bounce_data=wp.zeros(0, dtype=ReplayBounceData),
+                path_data=wp.zeros(0, dtype=ReplayPathData),
+            )
 
         with wp.ScopedTimer("render single iteration") as timer:
-            timer.extra_msg = f"iteration {self._num_iter}/{self.max_iter}"
+            timer.extra_msg = f"iteration {self._num_iter + 1}/{self.max_iter}"
             wp.launch(
                 kernel=init_path_segments,
                 dim=self.width * self.height,
                 inputs=[
-                    self._path_segments,
-                    self._path_flags,
                     self.width,
                     self.height,
                     self.cam_params.pos,
                     self.cam_params.fov_x,
                     self.cam_params.fov_y,
                 ],
-            )
-
-            # cache first hits
-            wp.launch(
-                kernel=intersect,
-                dim=self.width * self.height,
-                inputs=[
-                    self.bvh_id,
+                outputs=[
                     self._path_segments,
-                    self._path_flags,
-                    self.meshes,
-                    1e6,
-                    first_hits,
                 ],
             )
 
-            while True:  # while there are still active paths
-                if self._num_iter > 0:
+            # cache first hits since we're sending just 1 ray per pixel (no measurement integral involved)
+            if self._num_iter == 0:
+                wp.launch(
+                    kernel=intersect,
+                    dim=self.width * self.height,
+                    inputs=[
+                        self.bvh_id,
+                        self._path_segments,
+                        self.meshes,
+                        1e6,
+                    ],
+                    outputs=[self._first_hits],
+                )
+
+            self._num_finished_paths.zero_()
+            for depth in range(self.max_depth):
+                current_hits = self._first_hits
+                if depth > 0:
                     wp.launch(
                         kernel=intersect,
                         dim=self.width * self.height,
                         inputs=[
                             self.bvh_id,
                             self._path_segments,
-                            self._path_flags,
                             self.meshes,
                             1e6,
-                            hits,
                         ],
+                        outputs=[self._hits],
                     )
+                    current_hits = self._hits
 
-                current_hits = hits if self._num_iter > 0 else first_hits
                 wp.launch(
                     kernel=shade,
                     dim=self.width * self.height,
                     inputs=[
+                        record_path_replay_data,
                         self.bvh_id,
                         current_hits,
                         self.meshes,
@@ -666,46 +866,51 @@ class Renderer:
                         self.materials,
                         self.max_depth,
                         self._num_iter,
+                    ],
+                    outputs=[
                         self._path_segments,
-                        self._path_flags,
+                        self._num_finished_paths,
+                        replay_data.bounce_data,
+                        replay_data.path_data,
                     ],
                 )
-                host_path_flags = self._path_flags.numpy()
-                should_continue = False
-                for i in range(self.width * self.height):
-                    if host_path_flags[i] == 0:
-                        should_continue = True
-                        break
-                if not should_continue:
+                if self._num_finished_paths.numpy()[0] == self.width * self.height:
                     break
 
             wp.launch(
                 kernel=accumulate,
                 dim=self.width * self.height,
                 inputs=[
+                    self._num_iter + 1,
                     self._path_segments,
-                    self.radiances,
-                    self._num_iter,
                 ],
+                outputs=[self.radiance_sum, self.radiances],
             )
             self._num_iter += 1
 
         return self._num_iter < self.max_iter
 
-    def get_pixels(self) -> np.ndarray:
-        wp.launch(
-            kernel=tonemap,
-            dim=self.width * self.height,
-            inputs=[
-                self.radiances,
-                self.dev_pixels,
-            ],
-        )
-        return self.dev_pixels.numpy().reshape((self.height, self.width, 3))
+    def replay(self):
+        pass
+
+    def get_pixels(self, use_tonemap: bool = True) -> np.ndarray:
+        if use_tonemap:
+            pixels = wp.zeros(self.width * self.height, dtype=wp.vec3)
+
+            wp.launch(
+                kernel=tonemap,
+                dim=self.width * self.height,
+                inputs=[self.radiances],
+                outputs=[pixels],
+            )
+            return pixels.numpy().reshape((self.height, self.width, 3))
+        else:
+            return self.radiances.numpy().reshape((self.height, self.width, 3))
 
     def reset(self):
         self._num_iter = 0
         self.radiances.zero_()
+        self.radiance_sum.zero_()
 
 
 g_running = True
@@ -721,7 +926,7 @@ def record_frame(frame_times_list):
     frame_times_list.append(elapsed)
 
 
-def log_frame_time_stats(frame_times, spp: int):
+def log_frame_time_stats(frame_times: list[float], spp: int):
     if not frame_times:
         return
     avg_ms = 1000.0 * sum(frame_times) / len(frame_times)
@@ -736,27 +941,106 @@ def log_frame_time_stats(frame_times, spp: int):
     )
 
 
-def save_image(renderer, path_arg: pathlib.Path | None, allow_default: bool):
+def save_image(
+    renderer: Renderer, path_arg: pathlib.Path | None, save_raw: bool = False
+):
     """
-    Saves the current tonemapped image. If allow_default is True and path_arg
-    is None, a default path render.png in the repo root is used. Returns the
-    resolved output path if saved, otherwise None.
+    Saves the current image to a directory. The filename matches the USD stage
+    name and the extension is selected via save_raw. If path_arg is None, the
+    repo root is used as the output directory. Returns the resolved output path
+    if saved, otherwise None.
     """
-    output_path = path_arg
-    if output_path is None and allow_default:
-        output_path = (pathlib.Path(__file__).parent.parent / "render.png").resolve()
-    if output_path is None:
-        return None
+    extension = "hdr" if save_raw else "png"
+    stage_stem = (
+        renderer.usd_path.stem
+        if isinstance(getattr(renderer, "usd_path", None), pathlib.Path)
+        else "render"
+    )
 
-    pixels = renderer.get_pixels()
+    output_dir = (path_arg or pathlib.Path(__file__).parent.parent).resolve()
+    output_path = (output_dir / f"{stage_stem}.{extension}").resolve()
+
+    pixels = renderer.get_pixels(use_tonemap=not save_raw)
     pixels = pixels[::-1, ...]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    imageio.imwrite(
-        output_path.as_posix(),
-        (pixels * 255.0).clip(0.0, 255.0).astype(np.uint8),
-    )
-    logger.info(f"Saved image to {output_path}")
-    return output_path
+    if save_raw:
+        hdr_pixels = pixels.astype(np.float32)
+        imageio.imwrite(output_path.as_posix(), hdr_pixels, format="HDR-FI")
+    else:
+        imageio.imwrite(
+            output_path.as_posix(),
+            (pixels * 255.0).clip(0.0, 255.0).astype(np.uint8),
+        )
+
+
+def load_target_image(target_path: pathlib.Path, renderer: Renderer) -> np.ndarray:
+    """
+    Load and validate a target RGB image for learning/visualization.
+    Ensures shape/channel match and aligns orientation with the renderer output.
+    Only HDR inputs are accepted to avoid unintended 8-bit gamma/tonemap issues.
+    """
+    suffix = target_path.suffix.lower()
+    allowed_hdr_exts = {".hdr", ".exr"}
+    if suffix and suffix not in allowed_hdr_exts:
+        raise ValueError(
+            f"Target image must be HDR ({', '.join(sorted(allowed_hdr_exts))}); got {suffix or 'no extension'}."
+        )
+
+    img = imageio.imread(target_path)
+    if img.ndim == 2:
+        raise ValueError("Target image must be RGB, got grayscale.")
+    if img.shape[2] == 4:
+        img = img[..., :3]
+    if img.shape[2] != 3:
+        raise ValueError("Target image must have 3 channels (RGB).")
+
+    img = img.astype(np.float32)
+    if suffix not in allowed_hdr_exts:
+        # Non-HDR inputs (if ever allowed) would be rescaled from 0-255 range.
+        if img.max() > 1.5:
+            img /= 255.0
+
+    if img.shape[0] != renderer.height or img.shape[1] != renderer.width:
+        raise ValueError(
+            f"Target image shape {img.shape[:2]} does not match renderer output "
+            f"({renderer.height}, {renderer.width})."
+        )
+
+    # Invert and flatten to match renderer's in-memory layout.
+    return img[::-1, ...].reshape(-1)
+
+
+def do_render_loop(
+    renderer: Renderer,
+    *,
+    save_path: pathlib.Path | None,
+    save_raw: bool = False,
+    fig: plt.Figure | None = None,
+    render_image: mpimg.AxesImage | None = None,
+    label: plt.Text | None = None,
+):
+    frame_times = []
+    while g_running:
+        with record_frame(frame_times) as info:
+            can_continue = renderer.render()
+        frame_ms = info["elapsed"] * 1000.0
+        if save_path and not can_continue:
+            save_image(renderer, save_path, save_raw=save_raw)
+            break
+
+        if render_image:
+            render_image.set_data(renderer.get_pixels())
+
+        if fig:
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
+        if label:
+            label.set_text(f"Iteration: {renderer.num_iter} ({frame_ms:.1f} ms)")
+        if not can_continue:
+            break
+
+    log_frame_time_stats(frame_times, renderer.num_iter)
 
 
 if __name__ == "__main__":
@@ -780,14 +1064,19 @@ if __name__ == "__main__":
         "--width", type=int, default=1024, help="Output image width in pixels."
     )
     parser.add_argument(
-        "--max-iter", type=int, default=100, help="Maximum number of iterations."
+        "--spp", type=int, default=100, help="Number of samples per pixel."
     )
     parser.add_argument("--max-depth", type=int, default=5, help="Maximum path depth.")
     parser.add_argument(
         "--save-path",
         type=pathlib.Path,
         default=None,
-        help="Path to save the rendered image.",
+        help="Directory to save the rendered image; filename matches the USD stage.",
+    )
+    parser.add_argument(
+        "--save-raw",
+        action="store_true",
+        help="Save the raw radiance output as an HDR image.",
     )
     parser.add_argument(
         "--force-bvh",
@@ -799,57 +1088,100 @@ if __name__ == "__main__":
         action="store_true",
         help="Run without opening a window; render to completion and save the image.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode.",
+    )
+
+    diffrt_group = parser.add_argument_group("Differentiable Rendering")
+    diffrt_group.add_argument(
+        "--learning-rate", type=float, default=0.01, help="Learning rate."
+    )
+    diffrt_group.add_argument(
+        "--learning-iter",
+        type=int,
+        default=10,
+        help="Number of learning iterations.",
+    )
+    diffrt_group.add_argument(
+        "--batch-spp",
+        type=int,
+        default=1,
+        help="Number of samples per pixel during learning.",
+    )
+    diffrt_group.add_argument(
+        "--target-image",
+        type=pathlib.Path,
+        default=None,
+        help="Path to the target image. If not provided, learning will be disabled.",
+    )
 
     args = parser.parse_args()
+
+    if args.save_path:
+        # Require a directory without an explicit filename/extension.
+        if args.save_path.suffix:
+            parser.error(
+                "--save-path should be a directory (omit filename and extension)."
+            )
+        if args.save_path.exists() and not args.save_path.is_dir():
+            parser.error("--save-path points to a file; provide a directory.")
+        args.save_path = args.save_path.resolve()
+
+    if args.save_raw:
+        # Ensure the HDR writer is available up front; fail fast if not.
+        try:
+            from imageio.plugins import freeimage
+
+            freeimage.download()  # idempotent; ensures plugin/DLL is present
+        except Exception as exc:
+            parser.error(f"HDR output requested but FreeImage is unavailable: {exc}")
+
+    if args.debug:
+        wp.config.verify_autodiff = True
+        wp.config.verify_autograd_array_access = True
 
     with wp.ScopedDevice(args.device):
         renderer = Renderer(
             width=args.width,
             usd_path=args.usd_path,
-            max_iter=args.max_iter,
+            spp=args.spp,
             max_depth=args.max_depth,
             force_bvh=args.force_bvh,
         )
 
-        frame_times: list[float] = []
-
         if args.headless:
             logger.info("Running in headless mode (no UI).")
-            while True:
-                with record_frame(frame_times):
-                    can_continue = renderer.render()
-                if not can_continue:
-                    break
 
-            save_image(renderer, args.save_path, allow_default=True)
-            log_frame_time_stats(frame_times, renderer.num_iter)
+            if args.target_image is None:
+                do_render_loop(
+                    renderer, save_path=args.save_path, save_raw=args.save_raw
+                )
+            else:
+                target_image = load_target_image(args.target_image, renderer)
+                with LearningSession(
+                    renderer,
+                    target_image=target_image,
+                    learning_rate=args.learning_rate,
+                    max_epochs=args.learning_iter,
+                ) as session:
+                    while True:
+                        loss = session.step()
+                        if loss is None:
+                            break
+                        logger.info(
+                            "Learning step %d/%d: loss=%.6f",
+                            session.epoch,
+                            session.max_epochs,
+                            session.loss_value,
+                        )
+                do_render_loop(
+                    renderer, save_path=args.save_path, save_raw=args.save_raw
+                )
         else:
             plt.ion()  # turn on interactive mode
-            fig, ax = plt.subplots()
-
-            ax.set_title("PBR Renderer")
-            ax.set_axis_off()
-
-            im = ax.imshow(
-                np.zeros((renderer.height, renderer.width, 3)),
-                origin="lower",
-                interpolation="antialiased",
-                aspect="equal",
-            )
-            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-            # add label in top-left corner
-            label = ax.text(
-                0.01,
-                0.99,
-                "Iteration: 0",
-                color="white",
-                fontsize=9,
-                ha="left",
-                va="top",
-                transform=ax.transAxes,  # coordinates relative to axes (0–1)
-            )
-            plt.show(block=False)
+            fig = plt.figure()
 
             def handle_close(_):
                 global g_running
@@ -858,20 +1190,120 @@ if __name__ == "__main__":
             fig.canvas.mpl_connect("close_event", handle_close)
 
             # main loop
-            while g_running:
-                with record_frame(frame_times) as info:
-                    can_continue = renderer.render()
-                frame_ms = info["elapsed"] * 1000.0
-                if args.save_path and not can_continue:
-                    save_image(renderer, args.save_path, allow_default=False)
-                    break
+            if args.target_image is None:
+                ax = fig.add_subplot()
+                # layout
+                ax.set_title("PBR Renderer")
+                ax.set_axis_off()
 
-                im.set_data(renderer.get_pixels())
-                fig.canvas.draw()
-                fig.canvas.flush_events()
-                label.set_text(f"Iteration: {renderer.num_iter} ({frame_ms:.1f} ms)")
-                if not can_continue:
-                    break
+                render_image = ax.imshow(
+                    np.zeros((renderer.height, renderer.width, 3)),
+                    origin="lower",
+                    interpolation="antialiased",
+                    aspect="equal",
+                )
+                plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
+                # add label in top-left corner
+                render_image_label = ax.text(
+                    0.01,
+                    0.99,
+                    "Iteration: 0",
+                    color="white",
+                    fontsize=9,
+                    ha="left",
+                    va="top",
+                    transform=ax.transAxes,  # coordinates relative to axes (0–1)
+                )
+                plt.show(block=False)
+
+                # normal rendering loop
+                do_render_loop(
+                    renderer,
+                    save_path=args.save_path,
+                    save_raw=args.save_raw,
+                    fig=fig,
+                    render_image=render_image,
+                    label=render_image_label,
+                )
+            else:
+                # layout with render, per-pixel loss heatmap, and total loss curve
+                gs = fig.add_gridspec(2, 2)
+                ax_render = fig.add_subplot(gs[0, 0])
+                ax_render.set_title("Render")
+                ax_render.set_axis_off()
+                render_image = ax_render.imshow(
+                    np.zeros((renderer.height, renderer.width, 3)),
+                    origin="lower",
+                    interpolation="antialiased",
+                    aspect="equal",
+                )
+                render_image_label = ax_render.text(
+                    0.01,
+                    0.99,
+                    "Epoch: 0",
+                    color="white",
+                    fontsize=9,
+                    ha="left",
+                    va="top",
+                    transform=ax_render.transAxes,
+                )
+
+                ax_per_pixel_loss = fig.add_subplot(gs[1, 0])
+                ax_per_pixel_loss.set_title("Per-pixel Loss")
+                ax_per_pixel_loss.set_axis_off()
+                ax_per_pixel_loss_image = ax_per_pixel_loss.imshow(
+                    np.zeros((renderer.height, renderer.width, 1)),
+                    origin="lower",
+                    interpolation="antialiased",
+                    aspect="equal",
+                    cmap="viridis",
+                )
+
+                ax_total_loss = fig.add_subplot(gs[1, 1])
+                ax_total_loss.set_title("Total Loss")
+                ax_total_loss.set_xlabel("Epoch")
+                ax_total_loss.set_ylabel("Loss")
+                (ax_total_loss_line,) = ax_total_loss.plot([], [])
+
+                plt.show(block=False)
+
+                target_image = load_target_image(args.target_image, renderer)
+                losses = []
+
+                with LearningSession(
+                    renderer,
+                    target_image=target_image,
+                    learning_rate=args.learning_rate,
+                    batch_spp=args.batch_spp,
+                    max_epochs=args.learning_iter,
+                ) as session:
+                    while g_running:
+                        loss = session.step()
+                        if loss is None:
+                            break
+
+                        losses.append(session.loss_value)
+                        render_image.set_data(renderer.get_pixels())
+                        ax_per_pixel_loss_image.set_data(session.per_pixel_mse_host)
+                        ax_per_pixel_loss_image.autoscale()
+
+                        ax_total_loss_line.set_data(np.arange(len(losses)), losses)
+                        ax_total_loss.relim()
+                        ax_total_loss.autoscale_view()
+
+                        render_image_label.set_text(
+                            f"Epoch: {session.epoch}/{session.max_epochs} Loss: {session.loss_value:.4f}"
+                        )
+                        fig.canvas.draw()
+                        fig.canvas.flush_events()
+
+                do_render_loop(
+                    renderer,
+                    save_path=args.save_path,
+                    save_raw=args.save_raw,
+                    fig=fig,
+                    render_image=render_image,
+                    label=render_image_label,
+                )
             plt.close()
-            log_frame_time_stats(frame_times, renderer.num_iter)

@@ -176,7 +176,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/plastic_grey>
+                rel material:binding = </Materials/diffuse_green>
             }
         }
     }

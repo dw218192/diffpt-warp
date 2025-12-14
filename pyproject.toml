@@ -10,5 +10,5 @@ dependencies = [
     "numpy",
     "usd-core",
     "types-usd",
-    "imageio",
+    "imageio[freeimage]",
 ]

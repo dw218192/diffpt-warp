@@ -241,7 +241,8 @@ def mat_sample(
 
     The definition of incoming and outgoing directions is consistent with PBRT.
     """
-    prob_specular = wp.lerp(0.5, 1.0, material.metallic)
+    # prob_specular = wp.lerp(0.5, 1.0, material.metallic)
+    prob_specular = 0.5
     choice = wp.randf(rand_state)
 
     if choice < prob_specular:
@@ -270,7 +271,8 @@ def mat_pdf(
         return 0.0
     h = h_vec * (1.0 / wp.sqrt(h_len_sq))
 
-    prob_specular = wp.lerp(0.5, 1.0, material.metallic)
+    # prob_specular = wp.lerp(0.5, 1.0, material.metallic)
+    prob_specular = 0.5
     prob_diffuse = 1.0 - prob_specular
 
     pdf_wi = ggx_visible_normal_pdf_wi(wo, h, material.roughness)
