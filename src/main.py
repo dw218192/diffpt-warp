@@ -79,13 +79,12 @@ class ReplayPathData:
 # i-th bounce data is logically stored at bounce_data[tid, i - 1]
 @wp.struct
 class ReplayBounceData:
-    hit_mat_id: int
-    wo_local: wp.vec3
+    hit_mat_id: wp.uint64
+    wo: wp.vec3
 
     # BSDF-sampled continuation
-    wi_bsdf_local: wp.vec3
+    wi_bsdf: wp.vec3
     pdf_bsdf: float
-    throughput_before: wp.vec3
 
     # NEE (optional per bounce)
     nee_valid: int
@@ -449,16 +448,20 @@ def shade(
 
             # invalidate replay data
             if record_path_replay_data:
-                replay_path_data[tid].path_len = 0
+                path_data = replay_path_data[tid]
+                path_data.pixel_idx = path.pixel_idx
+                path_data.path_len = 0
+                replay_path_data[tid] = path_data
 
             return
 
         # record bsdf continuation for replay
         if record_path_replay_data:
             bounce_data = replay_bounce_data[replay_bounce_data_idx]
-            bounce_data.wi_bsdf_local = wi
+            bounce_data.hit_mat_id = mesh.material_id
+            bounce_data.wo = wo
+            bounce_data.wi_bsdf = wi
             bounce_data.pdf_bsdf = pdf
-            bounce_data.throughput_before = throughput
             replay_bounce_data[replay_bounce_data_idx] = bounce_data
 
         path.point = hit_point + hit_normal * EPSILON
@@ -491,8 +494,12 @@ def shade(
 
             # invalidate replay data
             if record_path_replay_data:
-                replay_path_data[tid].path_len = 0
+                path_data = replay_path_data[tid]
+                path_data.pixel_idx = path.pixel_idx
+                path_data.path_len = 0
+                replay_path_data[tid] = path_data
 
+            path_segments[tid] = path
             return
 
         inv_p_rr = 1.0 / p_rr
@@ -516,7 +523,10 @@ def shade(
 
             # invalidate replay data
             if record_path_replay_data:
-                replay_path_data[tid].path_len = 0
+                path_data = replay_path_data[tid]
+                path_data.pixel_idx = path.pixel_idx
+                path_data.path_len = 0
+                replay_path_data[tid] = path_data
 
             return
 
@@ -552,38 +562,37 @@ def replay_path(
     throughput = wp.vec3(1.0)
 
     path_data = replay_path_data[tid]
+    pixel_idx = path_data.pixel_idx
     if path_data.path_len <= 0:
-        out_radiance[tid] = wp.vec3(0.0)
+        out_radiance[pixel_idx] = wp.vec3(0.0)
         return
 
     for d in range(path_data.path_len - 1):
         rec = replay_bounce_data[tid * max_depth + d]
 
         mat = materials[rec.hit_mat_id]
-        wo = rec.wo_local
+        wo = rec.wo
 
         # --- NEE term at this bounce (if recorded) ---
         if rec.nee_valid != 0:
             wiL = rec.wi_nee_local
             # replay same estimator form as shade():
-            # contrib = throughput_before * (bsdf * cos / light_pdf_solid_angle) * Le * mis_w
+            # contrib = throughput * (bsdf * cos / light_pdf_solid_angle) * Le * mis_w
             fL = mat_eval_bsdf(mat, wiL, wo)
-            cL = wp.cw_mul(
-                rec.throughput_before, fL * wiL.z / rec.light_pdf_solid_angle
-            )
+            cL = wp.cw_mul(throughput, fL * wiL.z / rec.light_pdf_solid_angle)
             cL = wp.cw_mul(cL, rec.Le_nee)
             radiance += rec.mis_w_nee * cL
 
         # --- BSDF continuation throughput update ---
-        wi = rec.wi_bsdf_local
+        wi = rec.wi_bsdf
         pdf = rec.pdf_bsdf
 
         if pdf <= 0.0 or wi.z <= 0.0:
-            out_radiance[tid] = wp.vec3(0.0)
+            out_radiance[pixel_idx] = wp.vec3(0.0)
             return
 
         f = mat_eval_bsdf(mat, wi, wo)
-        throughput = wp.cw_mul(rec.throughput_before, f * wi.z / pdf)
+        throughput = wp.cw_mul(throughput, f * wi.z / pdf)
 
         if rec.add_emissive != 0:
             radiance += wp.cw_mul(
@@ -783,14 +792,11 @@ class Renderer:
     def num_iter(self):
         return self._num_iter
 
-    def render(self, record_path_replay_data: bool = False):
+    def render(self, record_path_replay_data: bool = False) -> tuple[bool, ReplayData]:
         """
         Render a single iteration of the path tracer.
         If record_path_replay_data is True, extra data will be recorded to allow path replay backpropagation.
         """
-        if self._num_iter >= self.max_iter:
-            return False
-
         if record_path_replay_data:
             replay_data = self.ReplayData(
                 is_valid=True,
@@ -805,6 +811,9 @@ class Renderer:
                 bounce_data=wp.zeros(0, dtype=ReplayBounceData),
                 path_data=wp.zeros(0, dtype=ReplayPathData),
             )
+
+        if self._num_iter >= self.max_iter:
+            return False, replay_data
 
         with wp.ScopedTimer("render single iteration") as timer:
             timer.extra_msg = f"iteration {self._num_iter + 1}/{self.max_iter}"
@@ -888,10 +897,32 @@ class Renderer:
             )
             self._num_iter += 1
 
-        return self._num_iter < self.max_iter
+        return self._num_iter < self.max_iter, replay_data
 
-    def replay(self):
-        pass
+    def replay(self, replay_data: ReplayData) -> wp.array:
+        """
+        Replay the given paths to reconstruct radiance using stored bounce data.
+        Returns the reconstructed radiance.
+        """
+        if not replay_data.is_valid:
+            raise RuntimeError(
+                "Replay data unavailable. Call render(record_path_replay_data=True) first."
+            )
+
+        radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
+        wp.launch(
+            kernel=replay_path,
+            dim=self.width * self.height,
+            inputs=[
+                self.max_depth,
+                replay_data.bounce_data,
+                replay_data.path_data,
+                self.materials,
+            ],
+            outputs=[radiances],
+        )
+
+        return radiances
 
     def get_pixels(self, use_tonemap: bool = True) -> np.ndarray:
         if use_tonemap:
@@ -1018,11 +1049,34 @@ def do_render_loop(
     fig: plt.Figure | None = None,
     render_image: mpimg.AxesImage | None = None,
     label: plt.Text | None = None,
+    replay_image: mpimg.AxesImage | None = None,
 ):
+    @wp.kernel
+    def _accumulate_replay(
+        # Read
+        num_samples: int,
+        one_spp_radiances: wp.array(dtype=wp.vec3),
+        # Write
+        radiances: wp.array(dtype=wp.vec3),
+    ):
+        tid = wp.tid()
+        pixel_idx = tid
+        radiances[pixel_idx] += (
+            one_spp_radiances[pixel_idx] - radiances[pixel_idx]
+        ) / float(num_samples)
+
     frame_times = []
+    debug_replay = replay_image is not None
+
+    if debug_replay:
+        replay_radiances = wp.zeros(renderer.width * renderer.height, dtype=wp.vec3)
+        replay_pixels = wp.zeros_like(replay_radiances)
+
     while g_running:
         with record_frame(frame_times) as info:
-            can_continue = renderer.render()
+            can_continue, replay_data = renderer.render(
+                record_path_replay_data=debug_replay
+            )
         frame_ms = info["elapsed"] * 1000.0
         if save_path and not can_continue:
             save_image(renderer, save_path, save_raw=save_raw)
@@ -1031,6 +1085,27 @@ def do_render_loop(
         if render_image:
             render_image.set_data(renderer.get_pixels())
 
+        if debug_replay and can_continue:
+            # compute replay image
+            radiances = renderer.replay(replay_data)
+            wp.launch(
+                kernel=_accumulate_replay,
+                dim=renderer.width * renderer.height,
+                inputs=[
+                    renderer.num_iter,
+                    radiances,
+                ],
+                outputs=[replay_radiances],
+            )
+            wp.launch(
+                kernel=tonemap,
+                dim=renderer.width * renderer.height,
+                inputs=[replay_radiances],
+                outputs=[replay_pixels],
+            )
+            replay_image.set_data(
+                replay_pixels.numpy().reshape((renderer.height, renderer.width, 3))
+            )
         if fig:
             fig.canvas.draw()
             fig.canvas.flush_events()
@@ -1191,7 +1266,25 @@ if __name__ == "__main__":
 
             # main loop
             if args.target_image is None:
-                ax = fig.add_subplot()
+                # if debug mode is enabled, add a "replay image", i.e. the image generated by replaying the paths.
+                if args.debug:
+                    gs = fig.add_gridspec(1, 2, width_ratios=[1, 1])
+                    ax = fig.add_subplot(gs[0, 0])
+                    ax_replay = fig.add_subplot(gs[0, 1])
+                    ax_replay.set_title("Replay (debug)")
+                    ax_replay.set_axis_off()
+                    replay_image = ax_replay.imshow(
+                        np.zeros((renderer.height, renderer.width, 3)),
+                        origin="lower",
+                        interpolation="antialiased",
+                        aspect="equal",
+                    )
+                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0, wspace=0.05)
+                else:
+                    ax = fig.add_subplot()
+                    replay_image = None
+                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
                 # layout
                 ax.set_title("PBR Renderer")
                 ax.set_axis_off()
@@ -1202,7 +1295,6 @@ if __name__ == "__main__":
                     interpolation="antialiased",
                     aspect="equal",
                 )
-                plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
                 # add label in top-left corner
                 render_image_label = ax.text(
@@ -1225,6 +1317,7 @@ if __name__ == "__main__":
                     fig=fig,
                     render_image=render_image,
                     label=render_image_label,
+                    replay_image=replay_image,
                 )
             else:
                 # layout with render, per-pixel loss heatmap, and total loss curve
