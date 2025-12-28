@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "Material",
     "create_material_from_usd_prim",
+    "clone_material",
     "is_emissive",
     "mat_eval_bsdf",
     "mat_sample",
@@ -64,6 +65,24 @@ def create_material_from_usd_prim(prim: UsdShade.Material):
 
     logger.debug(f"Material: {mat}")
     return mat
+
+
+def clone_material(src: Material) -> Material:
+    """
+    Clone a `Material` into a new struct instance.
+
+    This is intentionally a plain Python function (not a wp.func) since it's used
+    during scene setup on the host (e.g. to de-alias shared materials for learning).
+    """
+    dst = Material()
+    dst.base_color = src.base_color
+    dst.metallic = src.metallic
+    dst.roughness = src.roughness
+    dst.ior = src.ior
+    dst.emissive_color = src.emissive_color
+    dst.emissive_intensity = src.emissive_intensity
+    dst.opacity = src.opacity
+    return dst
 
 
 @wp.func

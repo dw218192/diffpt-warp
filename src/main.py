@@ -38,6 +38,7 @@ from mesh import (
 )
 from material import (
     Material,
+    clone_material,
     create_material_from_usd_prim,
     is_emissive,
     mat_eval_bsdf,
@@ -690,6 +691,8 @@ class Renderer:
         spp: int,
         max_depth: int,
         force_bvh: bool,
+        *,
+        unique_materials_per_mesh: bool = False,
     ):  # height will be computed from width and fov set in the USD stage's camera prim
 
         self.cam_params = CameraParams()
@@ -747,6 +750,33 @@ class Renderer:
                 self.meshes.append(mesh)
                 if mesh.is_light:
                     self.light_indices.append(len(self.meshes) - 1)
+
+        # When doing differentiable rendering, material sharing can make the target
+        # image impossible to fit (multiple meshes coupled through a shared parameter
+        # vector). Optionally duplicate materials so each mesh owns its own instance.
+        if unique_materials_per_mesh:
+            if len(self.materials) == 0:
+                raise ValueError("No materials found; cannot duplicate per-mesh.")
+
+            # Only duplicate when a material is shared by multiple meshes.
+            mat_id_to_mesh_indices: dict[int, list[int]] = {}
+            for mi, mesh in enumerate(self.meshes):
+                old_id = int(mesh.material_id)
+                mat_id_to_mesh_indices.setdefault(old_id, []).append(mi)
+
+            for old_id, mesh_indices in mat_id_to_mesh_indices.items():
+                if len(mesh_indices) <= 1:
+                    continue
+
+                for mi in mesh_indices[1:]:
+                    mesh = self.meshes[mi]
+                    self.materials.append(clone_material(self.materials[old_id]))
+                    mesh.material_id = wp.uint64(len(self.materials) - 1)
+
+            # ensure that every mesh has a unique material id
+            assert len(set([int(m.material_id) for m in self.meshes])) == len(
+                self.meshes
+            )
 
         if len(self.meshes) > BVH_THRESHOLD or force_bvh:
             self.bvh = wp.Bvh(
@@ -909,7 +939,9 @@ class Renderer:
                 "Replay data unavailable. Call render(record_path_replay_data=True) first."
             )
 
-        radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
+        radiances = wp.zeros(
+            self.width * self.height, dtype=wp.vec3, requires_grad=True
+        )
         wp.launch(
             kernel=replay_path,
             dim=self.width * self.height,
@@ -1012,6 +1044,9 @@ def load_target_image(target_path: pathlib.Path, renderer: Renderer) -> np.ndarr
     """
     suffix = target_path.suffix.lower()
     allowed_hdr_exts = {".hdr", ".exr"}
+    if suffix not in allowed_hdr_exts:
+        raise ValueError("Target image must be HDR.")
+
     if suffix and suffix not in allowed_hdr_exts:
         raise ValueError(
             f"Target image must be HDR ({', '.join(sorted(allowed_hdr_exts))}); got {suffix or 'no extension'}."
@@ -1026,10 +1061,6 @@ def load_target_image(target_path: pathlib.Path, renderer: Renderer) -> np.ndarr
         raise ValueError("Target image must have 3 channels (RGB).")
 
     img = img.astype(np.float32)
-    if suffix not in allowed_hdr_exts:
-        # Non-HDR inputs (if ever allowed) would be rescaled from 0-255 range.
-        if img.max() > 1.5:
-            img /= 255.0
 
     if img.shape[0] != renderer.height or img.shape[1] != renderer.width:
         raise ValueError(
@@ -1180,16 +1211,16 @@ if __name__ == "__main__":
         help="Number of learning iterations.",
     )
     diffrt_group.add_argument(
-        "--batch-spp",
-        type=int,
-        default=1,
-        help="Number of samples per pixel during learning.",
-    )
-    diffrt_group.add_argument(
         "--target-image",
         type=pathlib.Path,
         default=None,
         help="Path to the target image. If not provided, learning will be disabled.",
+    )
+    diffrt_group.add_argument(
+        "--final-spp",
+        type=int,
+        default=100,
+        help="Number of samples per pixel for the final rendering.",
     )
 
     args = parser.parse_args()
@@ -1224,6 +1255,7 @@ if __name__ == "__main__":
             spp=args.spp,
             max_depth=args.max_depth,
             force_bvh=args.force_bvh,
+            unique_materials_per_mesh=(args.target_image is not None),
         )
 
         if args.headless:
@@ -1251,6 +1283,9 @@ if __name__ == "__main__":
                             session.max_epochs,
                             session.loss_value,
                         )
+                # run a fresh render using the requested final spp
+                renderer.max_iter = args.final_spp
+                renderer.reset()
                 do_render_loop(
                     renderer, save_path=args.save_path, save_raw=args.save_raw
                 )
@@ -1320,9 +1355,37 @@ if __name__ == "__main__":
                     replay_image=replay_image,
                 )
             else:
-                # layout with render, per-pixel loss heatmap, and total loss curve
+                target_image = load_target_image(args.target_image, renderer)
+                target_radiances_wp = wp.array(
+                    target_image.reshape((-1, 3)), dtype=wp.vec3
+                )
+                target_pixels_wp = wp.zeros(
+                    renderer.width * renderer.height, dtype=wp.vec3
+                )
+                wp.launch(
+                    kernel=tonemap,
+                    dim=renderer.width * renderer.height,
+                    inputs=[target_radiances_wp],
+                    outputs=[target_pixels_wp],
+                )
+                target_pixels_tm = target_pixels_wp.numpy().reshape(
+                    (renderer.height, renderer.width, 3)
+                )
+
+                # layout with target, render, per-pixel loss heatmap, and total loss curve
                 gs = fig.add_gridspec(2, 2)
-                ax_render = fig.add_subplot(gs[0, 0])
+
+                ax_target = fig.add_subplot(gs[0, 0])
+                ax_target.set_title("Target")
+                ax_target.set_axis_off()
+                ax_target.imshow(
+                    target_pixels_tm,
+                    origin="lower",
+                    interpolation="antialiased",
+                    aspect="equal",
+                )
+
+                ax_render = fig.add_subplot(gs[0, 1])
                 ax_render.set_title("Render")
                 ax_render.set_axis_off()
                 render_image = ax_render.imshow(
@@ -1360,15 +1423,12 @@ if __name__ == "__main__":
                 (ax_total_loss_line,) = ax_total_loss.plot([], [])
 
                 plt.show(block=False)
-
-                target_image = load_target_image(args.target_image, renderer)
                 losses = []
 
                 with LearningSession(
                     renderer,
                     target_image=target_image,
                     learning_rate=args.learning_rate,
-                    batch_spp=args.batch_spp,
                     max_epochs=args.learning_iter,
                 ) as session:
                     while g_running:
@@ -1391,6 +1451,9 @@ if __name__ == "__main__":
                         fig.canvas.draw()
                         fig.canvas.flush_events()
 
+                # run a fresh render using the requested final spp
+                renderer.max_iter = args.final_spp
+                renderer.reset()
                 do_render_loop(
                     renderer,
                     save_path=args.save_path,
