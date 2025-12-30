@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "Material",
+    "GGX_MIN_ALPHA",
     "create_material_from_usd_prim",
     "clone_material",
     "is_emissive",

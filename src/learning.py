@@ -6,7 +6,7 @@ from typing import Optional, TYPE_CHECKING
 import numpy as np
 import warp as wp
 
-from material import Material
+from material import Material, GGX_MIN_ALPHA
 
 if TYPE_CHECKING:
     from main import Renderer
@@ -22,9 +22,8 @@ ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-8
 
-# Material parameter constraints (for physical validity / numerical stability)
-ROUGHNESS_MIN = 1e-3  # > 0 to avoid div-by-zero / bad NDF behavior
-ROUGHNESS_MAX = 1.0
+ALPHA_MIN = float(GGX_MIN_ALPHA)
+ALPHA_MAX = 1.0
 
 # Latent-space mapping safety.
 # Keeping decode away from exact {0,1} reduces saturation (tiny sigmoid' gradients).
@@ -115,9 +114,12 @@ def init_latent_from_materials(
     z.metallic = inv_bounded_sigmoid01(m.metallic, _LATENT_EPS)
 
     # roughness: [roughness_min, roughness_max] -> logit of normalized
-    inv_range = 1.0 / (ROUGHNESS_MAX - ROUGHNESS_MIN)
-    rn = (m.roughness - ROUGHNESS_MIN) * inv_range
-    z.roughness = logit01(rn, _LATENT_EPS)
+    # We optimize GGX alpha = roughness^2 (what the BSDF actually uses).
+    # Clamp alpha to GGX_MIN_ALPHA to match the BSDF behavior and avoid non-identifiability.
+    alpha = wp.max(m.roughness * m.roughness, float(ALPHA_MIN))
+    inv_range = 1.0 / (ALPHA_MAX - ALPHA_MIN)
+    an = (alpha - ALPHA_MIN) * inv_range
+    z.roughness = logit01(an, _LATENT_EPS)
 
     out_latent[i] = z
 
@@ -143,10 +145,10 @@ def decode_materials(
         bounded_sigmoid(latent_mats[i].base_color[2], _LATENT_EPS),
     )
 
-    # roughness: [ROUGHNESS_MIN, ROUGHNESS_MAX] (avoid 0 for GGX stability)
-    m.roughness = ROUGHNESS_MIN + (ROUGHNESS_MAX - ROUGHNESS_MIN) * sigmoid(
-        latent_mats[i].roughness
-    )
+    # roughness via GGX alpha = roughness^2:
+    # alpha in [ALPHA_MIN, ALPHA_MAX], then roughness = sqrt(alpha).
+    alpha = ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * sigmoid(latent_mats[i].roughness)
+    m.roughness = wp.sqrt(alpha)
 
     # metallic: [0,1]
     m.metallic = bounded_sigmoid(latent_mats[i].metallic, _LATENT_EPS)
@@ -190,10 +192,12 @@ def decode_latent_grads(
     sm = sigmoid(z.metallic)
     gz.metallic = g.metallic * scale * sm * (1.0 - sm)
 
-    # roughness: roughness_min + range * sigmoid(z)
+    # roughness via alpha = ALPHA_MIN + range * sigmoid(z), roughness = sqrt(alpha)
+    # drough/dz = (0.5 / sqrt(alpha)) * range * sigmoid(z) * (1 - sigmoid(z))
     sr = sigmoid(z.roughness)
-    r_range = ROUGHNESS_MAX - ROUGHNESS_MIN
-    gz.roughness = g.roughness * r_range * sr * (1.0 - sr)
+    a_range = ALPHA_MAX - ALPHA_MIN
+    alpha = ALPHA_MIN + a_range * sr
+    gz.roughness = g.roughness * (0.5 / wp.sqrt(alpha)) * a_range * sr * (1.0 - sr)
 
     out_latent_grads[i] = gz
 
