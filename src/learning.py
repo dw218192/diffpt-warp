@@ -306,11 +306,21 @@ class LearningSession:
         target_image: np.ndarray,
         learning_rate: float,
         max_epochs: int,
+        rng_seed: int = 0,
+        resample_interval: int = 0,
     ):
         self.renderer = renderer
         self.learning_rate = learning_rate
         self._max_epochs = max_epochs
         self._epoch = 0
+        self._rng_seed = int(rng_seed)
+        if self._rng_seed < 0:
+            raise ValueError(f"rng_seed must be >= 0; got {self._rng_seed}")
+        self._resample_interval = int(resample_interval)
+        if self._resample_interval < 0:
+            raise ValueError(
+                f"resample_interval must be >= 0 (0 disables reseeding); got {self._resample_interval}"
+            )
 
         self._base_materials = renderer.materials
 
@@ -338,6 +348,7 @@ class LearningSession:
         self.initial_materials = wp.zeros_like(self._base_materials)
         self.current_loss: Optional[float] = None
         self._finalized = False
+        wp.copy(self.initial_materials, self._base_materials)
 
         # Latent parameterization: optimize an unconstrained buffer, decode -> renderer.materials.
         self.latent_materials = wp.zeros_like(self._base_materials, requires_grad=True)
@@ -380,7 +391,6 @@ class LearningSession:
         # Reset the loss and per-pixel loss gradients and values
         self.per_pixel_loss.zero_()
         self.loss.zero_()
-        self.renderer.reset()
         self.latent_materials.grad.zero_()
 
         radiance_sum = wp.zeros(num_pixels, dtype=wp.vec3, requires_grad=True)
@@ -413,6 +423,18 @@ class LearningSession:
 
         # For primal (path-recording) rendering, just copy tape decode to a render buffer.
         wp.copy(decoded_materials_render, decoded_materials_tape)
+
+        # Seed schedule:
+        # - Across epochs, optionally "resample" every `resample_interval` epochs to avoid overfitting a
+        #   single fixed Monte Carlo sample set (which can cause plateaus).
+        if self._resample_interval == 0:
+            seed_epoch = self._rng_seed
+        else:
+            seed_epoch = self._rng_seed + (self._epoch // self._resample_interval)
+
+        # Primal rendering uses internal accumulation buffers; reset at the start of the epoch.
+        self.renderer.reset()
+        self.renderer.rng_seed = int(seed_epoch)
 
         for _ in range(self.renderer.max_iter):
             # Primal rendering

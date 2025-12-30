@@ -315,6 +315,7 @@ def shade(
     materials: wp.array(dtype=Material),
     max_depth: int,
     iteration: int,
+    rng_seed: int,
     # Read/Write
     path_segments: wp.array(dtype=PathSegment),
     num_finished_paths: wp.array(dtype=int),
@@ -333,7 +334,7 @@ def shade(
 
     ro = path.point
     rd = path.ray_dir
-    rand_state = wp.rand_init(hash3(tid, path.depth, iteration))
+    rand_state = wp.rand_init(hash3(tid, path.depth, iteration + rng_seed))
     radiance = path.radiance
     throughput = path.throughput
 
@@ -816,6 +817,9 @@ class Renderer:
         self.max_depth = max_depth
 
         self._num_iter = 0
+        # RNG seed offset used by shading. Keeping this constant yields common-random-numbers
+        # across repeated renders; changing it "resamples" the estimator.
+        self.rng_seed = 0
         self._path_segments = wp.zeros(self.width * self.height, dtype=PathSegment)
         self._num_finished_paths = wp.zeros(1, dtype=int)
         self._hits = wp.zeros(self.width * self.height, dtype=HitData)
@@ -947,6 +951,7 @@ class Renderer:
                         self.materials,
                         self.max_depth,
                         self._num_iter,
+                        self.rng_seed,
                     ],
                     outputs=[
                         self._path_segments,
@@ -1265,6 +1270,18 @@ if __name__ == "__main__":
         default=100,
         help="Number of samples per pixel for the final rendering.",
     )
+    diffrt_group.add_argument(
+        "--rng-seed",
+        type=int,
+        default=0,
+        help="Base RNG seed offset for differentiable rendering.",
+    )
+    diffrt_group.add_argument(
+        "--resample-interval",
+        type=int,
+        default=0,
+        help="If >0, change the RNG seed every N learning epochs (helps escape fixed-sample plateaus). 0 disables reseeding.",
+    )
 
     args = parser.parse_args()
 
@@ -1286,6 +1303,13 @@ if __name__ == "__main__":
             freeimage.download()  # idempotent; ensures plugin/DLL is present
         except Exception as exc:
             parser.error(f"HDR output requested but FreeImage is unavailable: {exc}")
+
+    if args.rng_seed < 0:
+        parser.error(f"--rng-seed must be >= 0; got {args.rng_seed}")
+    if args.resample_interval < 0:
+        parser.error(
+            f"--resample-interval must be >= 0 (0 disables reseeding); got {args.resample_interval}"
+        )
 
     if args.debug:
         wp.config.verify_autodiff = True
@@ -1315,6 +1339,8 @@ if __name__ == "__main__":
                     target_image=target_image,
                     learning_rate=args.learning_rate,
                     max_epochs=args.learning_iter,
+                    rng_seed=args.rng_seed,
+                    resample_interval=args.resample_interval,
                 ) as session:
                     while True:
                         loss = session.step()
@@ -1473,6 +1499,8 @@ if __name__ == "__main__":
                     target_image=target_image,
                     learning_rate=args.learning_rate,
                     max_epochs=args.learning_iter,
+                    rng_seed=args.rng_seed,
+                    resample_interval=args.resample_interval,
                 ) as session:
                     while g_running:
                         loss = session.step()
