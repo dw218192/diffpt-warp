@@ -170,7 +170,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/metal_grey>
+                rel material:binding = </Materials/diffuse_green>
             }
         }
     }
@@ -193,7 +193,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/oxidized_metal_red>
+                rel material:binding = </Materials/diffuse_white>
             }
         }
     }
@@ -216,7 +216,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/plastic_grey>
+                rel material:binding = </Materials/diffuse_white>
             }
         }
     }
@@ -239,7 +239,7 @@ def Xform "geo" (
                 prepend apiSchemas = ["MaterialBindingAPI"]
             )
             {
-                rel material:binding = </Materials/rough_metal_yellow>
+                rel material:binding = </Materials/diffuse_white>
             }
         }
     }
