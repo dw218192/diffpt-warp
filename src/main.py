@@ -700,14 +700,18 @@ class Renderer:
 
         asset_stage: Usd.Stage = Usd.Stage.Open(usd_path.as_posix())
 
-        self.meshes = []
-        self.wp_meshes = []
-        self.light_indices = []
-        self.materials = []
+        # Keep Warp mesh objects alive for the lifetime of the renderer.
+        # The Mesh structs store mesh_id handles that become invalid if the
+        # underlying Warp meshes are garbage-collected.
+        self._wp_meshes: list[wp.Mesh] = []
+
+        meshes_list: list[Mesh] = []
+        light_indices_list: list[int] = []
+        materials_list: list[Material] = []
 
         # aabb values for bvh construction
-        self.bvh_lower_bounds = []
-        self.bvh_upper_bounds = []
+        bvh_lower_bounds: list[wp.vec3] = []
+        bvh_upper_bounds: list[wp.vec3] = []
 
         mat_prim_path_to_mat_id = {}
 
@@ -715,8 +719,8 @@ class Renderer:
         for prim in asset_stage.Traverse():
             if prim.IsA(UsdShade.Material):
                 material = create_material_from_usd_prim(UsdShade.Material(prim))
-                self.materials.append(material)
-                mat_prim_path_to_mat_id[prim.GetPrimPath()] = len(self.materials) - 1
+                materials_list.append(material)
+                mat_prim_path_to_mat_id[prim.GetPrimPath()] = len(materials_list) - 1
 
         # create rendering primitives
         for prim in asset_stage.Traverse():
@@ -744,23 +748,23 @@ class Renderer:
                 wp_mesh = res.warp_mesh
                 mesh = res.mesh
                 aabb = res.aabb
-                self.bvh_lower_bounds.append(aabb[0])
-                self.bvh_upper_bounds.append(aabb[1])
-                self.wp_meshes.append(wp_mesh)
-                self.meshes.append(mesh)
+                bvh_lower_bounds.append(aabb[0])
+                bvh_upper_bounds.append(aabb[1])
+                self._wp_meshes.append(wp_mesh)
+                meshes_list.append(mesh)
                 if mesh.is_light:
-                    self.light_indices.append(len(self.meshes) - 1)
+                    light_indices_list.append(len(meshes_list) - 1)
 
         # When doing differentiable rendering, material sharing can make the target
         # image impossible to fit (multiple meshes coupled through a shared parameter
         # vector). Optionally duplicate materials so each mesh owns its own instance.
         if unique_materials_per_mesh:
-            if len(self.materials) == 0:
+            if len(materials_list) == 0:
                 raise ValueError("No materials found; cannot duplicate per-mesh.")
 
             # Only duplicate when a material is shared by multiple meshes.
             mat_id_to_mesh_indices: dict[int, list[int]] = {}
-            for mi, mesh in enumerate(self.meshes):
+            for mi, mesh in enumerate(meshes_list):
                 old_id = int(mesh.material_id)
                 mat_id_to_mesh_indices.setdefault(old_id, []).append(mi)
 
@@ -769,23 +773,23 @@ class Renderer:
                     continue
 
                 for mi in mesh_indices[1:]:
-                    mesh = self.meshes[mi]
-                    self.materials.append(clone_material(self.materials[old_id]))
-                    mesh.material_id = wp.uint64(len(self.materials) - 1)
+                    mesh = meshes_list[mi]
+                    materials_list.append(clone_material(materials_list[old_id]))
+                    mesh.material_id = wp.uint64(len(materials_list) - 1)
 
             # ensure that every mesh has a unique material id
-            assert len(set([int(m.material_id) for m in self.meshes])) == len(
-                self.meshes
+            assert len(set([int(m.material_id) for m in meshes_list])) == len(
+                meshes_list
             )
 
-        if len(self.meshes) > BVH_THRESHOLD or force_bvh:
-            self.bvh = wp.Bvh(
-                wp.array(self.bvh_lower_bounds, dtype=wp.vec3),
-                wp.array(self.bvh_upper_bounds, dtype=wp.vec3),
+        if len(meshes_list) > BVH_THRESHOLD or force_bvh:
+            self._bvh = wp.Bvh(
+                wp.array(bvh_lower_bounds, dtype=wp.vec3),
+                wp.array(bvh_upper_bounds, dtype=wp.vec3),
                 "lbvh",
             )
         else:
-            self.bvh = None
+            self._bvh = None
 
         self.width = width
         self.height = int(
@@ -795,16 +799,16 @@ class Renderer:
         )
         logger.info(f"Using Camera Params: {self.cam_params}")
         logger.info(
-            f"Loaded {len(self.meshes)} meshes ({len(self.light_indices)} lights)"
+            f"Loaded {len(meshes_list)} meshes ({len(light_indices_list)} lights)"
         )
 
         # stores the running estimates of the radiances for each pixel
-        self.radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
-        self.radiance_sum = wp.zeros(self.width * self.height, dtype=wp.vec3)
+        self._radiances = wp.zeros(self.width * self.height, dtype=wp.vec3)
+        self._radiance_sum = wp.zeros(self.width * self.height, dtype=wp.vec3)
 
-        self.meshes = wp.array(self.meshes, dtype=Mesh)
-        self.materials = wp.array(self.materials, dtype=Material)
-        self.light_indices = wp.array(self.light_indices, dtype=int)
+        self._meshes = wp.array(meshes_list, dtype=Mesh)
+        self.materials = wp.array(materials_list, dtype=Material)
+        self._light_indices = wp.array(light_indices_list, dtype=int)
         self.max_iter = spp
         self.max_depth = max_depth
 
@@ -814,9 +818,43 @@ class Renderer:
         self._hits = wp.zeros(self.width * self.height, dtype=HitData)
         self._first_hits = wp.zeros_like(self._hits)
 
+    def _validate_materials_array(self, mats) -> None:
+        """
+        Validate `Renderer.materials` assignments.
+
+        This is intentionally strict because learning code may temporarily swap the
+        materials buffer; we want failures to be immediate and obvious.
+        """
+        if mats is None:
+            raise ValueError("materials cannot be None")
+        # duck-type for Warp arrays
+        if not hasattr(mats, "dtype") or not hasattr(mats, "shape"):
+            raise TypeError(f"materials must be a Warp array; got {type(mats)}")
+        if mats.dtype is not Material:
+            raise TypeError(f"materials dtype must be Material; got {mats.dtype}")
+        if len(mats) == 0:
+            raise ValueError("materials cannot be empty")
+        if hasattr(self, "_materials") and len(mats) != len(self._materials):
+            raise ValueError(
+                f"materials length mismatch: got {len(mats)} expected {len(self._materials)}"
+            )
+
+    def _assert_invariants(self) -> None:
+        # Keep these checks cheap; they run every render/replay call.
+        self._validate_materials_array(self._materials)
+
     @property
     def bvh_id(self):
-        return self.bvh.id if self.bvh else wp.uint64(-1)
+        return self._bvh.id if self._bvh else wp.uint64(-1)
+
+    @property
+    def materials(self):
+        return self._materials
+
+    @materials.setter
+    def materials(self, value):
+        self._validate_materials_array(value)
+        self._materials = value
 
     @property
     def num_iter(self):
@@ -827,6 +865,7 @@ class Renderer:
         Render a single iteration of the path tracer.
         If record_path_replay_data is True, extra data will be recorded to allow path replay backpropagation.
         """
+        self._assert_invariants()
         if record_path_replay_data:
             replay_data = self.ReplayData(
                 is_valid=True,
@@ -870,7 +909,7 @@ class Renderer:
                     inputs=[
                         self.bvh_id,
                         self._path_segments,
-                        self.meshes,
+                        self._meshes,
                         1e6,
                     ],
                     outputs=[self._first_hits],
@@ -886,7 +925,7 @@ class Renderer:
                         inputs=[
                             self.bvh_id,
                             self._path_segments,
-                            self.meshes,
+                            self._meshes,
                             1e6,
                         ],
                         outputs=[self._hits],
@@ -900,8 +939,8 @@ class Renderer:
                         record_path_replay_data,
                         self.bvh_id,
                         current_hits,
-                        self.meshes,
-                        self.light_indices,
+                        self._meshes,
+                        self._light_indices,
                         self.materials,
                         self.max_depth,
                         self._num_iter,
@@ -923,7 +962,7 @@ class Renderer:
                     self._num_iter + 1,
                     self._path_segments,
                 ],
-                outputs=[self.radiance_sum, self.radiances],
+                outputs=[self._radiance_sum, self._radiances],
             )
             self._num_iter += 1
 
@@ -934,6 +973,7 @@ class Renderer:
         Replay the given paths to reconstruct radiance using stored bounce data.
         Returns the reconstructed radiance.
         """
+        self._assert_invariants()
         if not replay_data.is_valid:
             raise RuntimeError(
                 "Replay data unavailable. Call render(record_path_replay_data=True) first."
@@ -963,17 +1003,17 @@ class Renderer:
             wp.launch(
                 kernel=tonemap,
                 dim=self.width * self.height,
-                inputs=[self.radiances],
+                inputs=[self._radiances],
                 outputs=[pixels],
             )
             return pixels.numpy().reshape((self.height, self.width, 3))
         else:
-            return self.radiances.numpy().reshape((self.height, self.width, 3))
+            return self._radiances.numpy().reshape((self.height, self.width, 3))
 
     def reset(self):
         self._num_iter = 0
-        self.radiances.zero_()
-        self.radiance_sum.zero_()
+        self._radiances.zero_()
+        self._radiance_sum.zero_()
 
 
 g_running = True

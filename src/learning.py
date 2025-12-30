@@ -23,15 +23,12 @@ ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-8
 
 # Material parameter constraints (for physical validity / numerical stability)
-BASE_COLOR_MIN = 0.0
-BASE_COLOR_MAX = 1.0
-METALLIC_MIN = 0.0
-METALLIC_MAX = 1.0
-EMISSIVE_COLOR_MIN = 0.0
-EMISSIVE_COLOR_MAX = 1.0
-EMISSIVE_INTENSITY_MIN = 0.0
 ROUGHNESS_MIN = 1e-3  # > 0 to avoid div-by-zero / bad NDF behavior
 ROUGHNESS_MAX = 1.0
+
+# Latent-space mapping safety.
+# Keeping decode away from exact {0,1} reduces saturation (tiny sigmoid' gradients).
+_LATENT_EPS = 1e-4
 
 
 @wp.kernel
@@ -69,19 +66,151 @@ def _compute_loss_kernel(
     wp.atomic_add(loss, 0, abs_diff)
 
 
+@wp.func
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + wp.exp(-x))
+
+
+@wp.func
+def logit01(p: float, eps: float) -> float:
+    # Clamp to avoid +/-inf at the boundaries.
+    p = wp.min(wp.max(p, eps), 1.0 - eps)
+    return wp.log(p) - wp.log(1.0 - p)
+
+
+@wp.func
+def bounded_sigmoid(x: float, eps: float) -> float:
+    # Map R -> (eps, 1-eps)
+    return eps + (1.0 - 2.0 * eps) * sigmoid(x)
+
+
+@wp.func
+def inv_bounded_sigmoid01(p: float, eps: float) -> float:
+    # Invert bounded_sigmoid(), robust to mild out-of-range p.
+    p = wp.min(wp.max(p, eps), 1.0 - eps)
+    q = (p - eps) / (1.0 - 2.0 * eps)  # in [0,1]
+    return logit01(q, eps)
+
+
 @wp.kernel
-def update_materials_adam(
+def init_latent_from_materials(
+    # Read
+    materials: wp.array(dtype=Material),
+    # Write
+    out_latent: wp.array(dtype=Material),
+):
+    i = wp.tid()
+    m = materials[i]
+
+    z = Material()
+
+    # base_color: [0,1] -> logit
+    z.base_color = wp.vec3(
+        inv_bounded_sigmoid01(m.base_color[0], _LATENT_EPS),
+        inv_bounded_sigmoid01(m.base_color[1], _LATENT_EPS),
+        inv_bounded_sigmoid01(m.base_color[2], _LATENT_EPS),
+    )
+
+    # metallic: [0,1] -> logit
+    z.metallic = inv_bounded_sigmoid01(m.metallic, _LATENT_EPS)
+
+    # roughness: [roughness_min, roughness_max] -> logit of normalized
+    inv_range = 1.0 / (ROUGHNESS_MAX - ROUGHNESS_MIN)
+    rn = (m.roughness - ROUGHNESS_MIN) * inv_range
+    z.roughness = logit01(rn, _LATENT_EPS)
+
+    out_latent[i] = z
+
+
+@wp.kernel
+def decode_materials(
+    # Read
+    latent_mats: wp.array(dtype=Material),
+    static_mats: wp.array(dtype=Material),
+    # Write
+    out_mats: wp.array(dtype=Material),
+):
+    i = wp.tid()
+    # Start from the "static" (non-learned) material so we preserve fields like
+    # emissive_color/emissive_intensity/ior/opacity that affect rendering but
+    # are not currently optimized in latent space.
+    m = static_mats[i]
+
+    # base_color: [0,1]
+    m.base_color = wp.vec3(
+        bounded_sigmoid(latent_mats[i].base_color[0], _LATENT_EPS),
+        bounded_sigmoid(latent_mats[i].base_color[1], _LATENT_EPS),
+        bounded_sigmoid(latent_mats[i].base_color[2], _LATENT_EPS),
+    )
+
+    # roughness: [ROUGHNESS_MIN, ROUGHNESS_MAX] (avoid 0 for GGX stability)
+    m.roughness = ROUGHNESS_MIN + (ROUGHNESS_MAX - ROUGHNESS_MIN) * sigmoid(
+        latent_mats[i].roughness
+    )
+
+    # metallic: [0,1]
+    m.metallic = bounded_sigmoid(latent_mats[i].metallic, _LATENT_EPS)
+
+    out_mats[i] = m
+
+
+@wp.kernel
+def decode_latent_grads(
+    # Read
+    latent_mats: wp.array(dtype=Material),
+    decoded_grads: wp.array(dtype=Material),  # dL/d(decoded_materials)
+    # Write
+    out_latent_grads: wp.array(dtype=Material),  # dL/d(latent_materials)
+):
+    """
+    Manual VJP for `decode_materials`.
+
+    Warp currently does not propagate gradients through our struct-to-struct decode kernel
+    (decoded_materials.grad is non-zero, but latent_materials.grad stays zero).
+    This kernel explicitly maps dL/d(decoded_materials) -> dL/d(latent_materials).
+    """
+    i = wp.tid()
+    z = latent_mats[i]
+    g = decoded_grads[i]
+
+    gz = Material()
+
+    # base_color: bounded_sigmoid(z, eps)
+    sx = sigmoid(z.base_color[0])
+    sy = sigmoid(z.base_color[1])
+    sz = sigmoid(z.base_color[2])
+    scale = 1.0 - 2.0 * _LATENT_EPS
+    gz.base_color = wp.vec3(
+        g.base_color[0] * scale * sx * (1.0 - sx),
+        g.base_color[1] * scale * sy * (1.0 - sy),
+        g.base_color[2] * scale * sz * (1.0 - sz),
+    )
+
+    # metallic: bounded_sigmoid(z, eps)
+    sm = sigmoid(z.metallic)
+    gz.metallic = g.metallic * scale * sm * (1.0 - sm)
+
+    # roughness: roughness_min + range * sigmoid(z)
+    sr = sigmoid(z.roughness)
+    r_range = ROUGHNESS_MAX - ROUGHNESS_MIN
+    gz.roughness = g.roughness * r_range * sr * (1.0 - sr)
+
+    out_latent_grads[i] = gz
+
+
+@wp.kernel
+def update_latent_materials_adam(
     # Read
     lr: float,
     t: float,
     grads: wp.array(dtype=Material),
     # Read/Write
-    materials: wp.array(dtype=Material),
+    latent_materials: wp.array(dtype=Material),
     m_state: wp.array(dtype=Material),
     v_state: wp.array(dtype=Material),
 ):
     tid = wp.tid()
-    mat = materials[tid]
+    z = latent_materials[tid]
     g = grads[tid]
     m = m_state[tid]
     v = v_state[tid]
@@ -94,7 +223,7 @@ def update_materials_adam(
     inv_bias1 = 1.0 / (1.0 - wp.pow(beta1, t))
     inv_bias2 = 1.0 / (1.0 - wp.pow(beta2, t))
 
-    # --- base_color (vec3) ---
+    # --- base_color (vec3 latent; unconstrained) ---
     m.base_color = beta1 * m.base_color + (1.0 - beta1) * g.base_color
     v.base_color = beta2 * v.base_color + (1.0 - beta2) * wp.cw_mul(
         g.base_color, g.base_color
@@ -109,89 +238,33 @@ def update_materials_adam(
             wp.sqrt(v_hat_c[2]) + eps,
         ),
     )
-    mat.base_color = wp.vec3(
-        wp.clamp(mat.base_color[0] - lr * step_c[0], BASE_COLOR_MIN, BASE_COLOR_MAX),
-        wp.clamp(mat.base_color[1] - lr * step_c[1], BASE_COLOR_MIN, BASE_COLOR_MAX),
-        wp.clamp(mat.base_color[2] - lr * step_c[2], BASE_COLOR_MIN, BASE_COLOR_MAX),
-    )
+    z.base_color = z.base_color - lr * step_c
 
-    # --- roughness (scalar) ---
+    # --- roughness (scalar latent; unconstrained) ---
     m.roughness = beta1 * m.roughness + (1.0 - beta1) * g.roughness
     v.roughness = beta2 * v.roughness + (1.0 - beta2) * (g.roughness * g.roughness)
     m_hat_r = m.roughness * inv_bias1
     v_hat_r = v.roughness * inv_bias2
-    mat.roughness = wp.clamp(
-        mat.roughness - lr * m_hat_r / (wp.sqrt(v_hat_r) + eps),
-        ROUGHNESS_MIN,
-        ROUGHNESS_MAX,
-    )
+    z.roughness = z.roughness - lr * m_hat_r / (wp.sqrt(v_hat_r) + eps)
 
-    # --- metallic (scalar) ---
+    # --- metallic (scalar latent; unconstrained) ---
     m.metallic = beta1 * m.metallic + (1.0 - beta1) * g.metallic
     v.metallic = beta2 * v.metallic + (1.0 - beta2) * (g.metallic * g.metallic)
     m_hat_m = m.metallic * inv_bias1
     v_hat_m = v.metallic * inv_bias2
-    mat.metallic = wp.clamp(
-        mat.metallic - lr * m_hat_m / (wp.sqrt(v_hat_m) + eps),
-        METALLIC_MIN,
-        METALLIC_MAX,
-    )
+    z.metallic = z.metallic - lr * m_hat_m / (wp.sqrt(v_hat_m) + eps)
 
-    # --- emissive_color (vec3) ---
-    m.emissive_color = beta1 * m.emissive_color + (1.0 - beta1) * g.emissive_color
-    v.emissive_color = beta2 * v.emissive_color + (1.0 - beta2) * wp.cw_mul(
-        g.emissive_color, g.emissive_color
-    )
-    m_hat_e = m.emissive_color * inv_bias1
-    v_hat_e = v.emissive_color * inv_bias2
-    step_e = wp.cw_div(
-        m_hat_e,
-        wp.vec3(
-            wp.sqrt(v_hat_e[0]) + eps,
-            wp.sqrt(v_hat_e[1]) + eps,
-            wp.sqrt(v_hat_e[2]) + eps,
-        ),
-    )
-    mat.emissive_color = wp.vec3(
-        wp.clamp(
-            mat.emissive_color[0] - lr * step_e[0],
-            EMISSIVE_COLOR_MIN,
-            EMISSIVE_COLOR_MAX,
-        ),
-        wp.clamp(
-            mat.emissive_color[1] - lr * step_e[1],
-            EMISSIVE_COLOR_MIN,
-            EMISSIVE_COLOR_MAX,
-        ),
-        wp.clamp(
-            mat.emissive_color[2] - lr * step_e[2],
-            EMISSIVE_COLOR_MIN,
-            EMISSIVE_COLOR_MAX,
-        ),
-    )
-
-    # --- emissive_intensity (scalar) ---
-    m.emissive_intensity = (
-        beta1 * m.emissive_intensity + (1.0 - beta1) * g.emissive_intensity
-    )
-    v.emissive_intensity = beta2 * v.emissive_intensity + (1.0 - beta2) * (
-        g.emissive_intensity * g.emissive_intensity
-    )
-    m_hat_i = m.emissive_intensity * inv_bias1
-    v_hat_i = v.emissive_intensity * inv_bias2
-    mat.emissive_intensity = wp.max(
-        mat.emissive_intensity - lr * m_hat_i / (wp.sqrt(v_hat_i) + eps),
-        EMISSIVE_INTENSITY_MIN,
-    )
-
-    # Opacity + IOR are currently not optimized; keep state in sync (optional).
+    # Not optimized in latent mode; keep Adam buffers inert.
+    m.emissive_color = wp.vec3(0.0)
+    v.emissive_color = wp.vec3(0.0)
+    m.emissive_intensity = 0.0
+    v.emissive_intensity = 0.0
     m.ior = 0.0
     v.ior = 0.0
     m.opacity = 0.0
     v.opacity = 0.0
 
-    # Write back
-    materials[tid] = mat
+    latent_materials[tid] = z
     m_state[tid] = m
     v_state[tid] = v
 
@@ -239,6 +312,8 @@ class LearningSession:
         self._max_epochs = max_epochs
         self._epoch = 0
 
+        self._base_materials = renderer.materials
+
         self.loss = wp.zeros(1, dtype=wp.float32, requires_grad=True)
         self.per_pixel_loss = wp.zeros(
             renderer.width * renderer.height, dtype=wp.float32, requires_grad=True
@@ -246,7 +321,12 @@ class LearningSession:
 
         if target_image.ndim != 1:
             raise ValueError(
-                f"Unexpected target_image shape {target_image.shape}, expected float."
+                f"Unexpected target_image shape {target_image.shape}; expected a flat (N,) float array."
+            )
+        expected_len = int(renderer.width * renderer.height * 3)
+        if int(target_image.shape[0]) != expected_len:
+            raise ValueError(
+                f"Unexpected target_image length {target_image.shape[0]}; expected {expected_len} (=W*H*3)."
             )
         self.target_image = wp.array(
             target_image.reshape((-1, 3)),
@@ -254,17 +334,23 @@ class LearningSession:
         )
 
         self.min_loss = float("inf")
-        self.best_materials = wp.zeros_like(renderer.materials)
-        self.initial_materials = wp.zeros_like(renderer.materials)
-        self.renderer.materials.requires_grad = True
-        wp.copy(self.best_materials, renderer.materials)
-        wp.copy(self.initial_materials, renderer.materials)
+        self.best_materials = wp.zeros_like(self._base_materials)
+        self.initial_materials = wp.zeros_like(self._base_materials)
         self.current_loss: Optional[float] = None
         self._finalized = False
 
-        # optimizer state (Adam): reuse Material struct for momentum (m) and velocity (v)
-        self._opt_m = wp.zeros_like(renderer.materials)
-        self._opt_v = wp.zeros_like(renderer.materials)
+        # Latent parameterization: optimize an unconstrained buffer, decode -> renderer.materials.
+        self.latent_materials = wp.zeros_like(self._base_materials, requires_grad=True)
+        wp.launch(
+            kernel=init_latent_from_materials,
+            dim=len(self._base_materials),
+            inputs=[
+                self._base_materials,
+            ],
+            outputs=[self.latent_materials],
+        )
+        self._opt_m = wp.zeros_like(self.latent_materials)
+        self._opt_v = wp.zeros_like(self.latent_materials)
 
     @property
     def epoch(self) -> int:
@@ -284,17 +370,57 @@ class LearningSession:
 
         num_pixels = self.renderer.width * self.renderer.height
 
+        decoded_materials_tape = wp.zeros_like(
+            self._base_materials, requires_grad=True
+        )
+        decoded_materials_render = wp.zeros_like(self._base_materials)
+
+        prev_renderer_materials = self.renderer.materials
+
         # Reset the loss and per-pixel loss gradients and values
         self.per_pixel_loss.zero_()
         self.loss.zero_()
         self.renderer.reset()
-        self.renderer.materials.grad.zero_()
+        self.latent_materials.grad.zero_()
 
         radiance_sum = wp.zeros(num_pixels, dtype=wp.vec3, requires_grad=True)
 
         tape = wp.Tape()
+        with tape:
+            wp.launch(
+                kernel=decode_materials,
+                dim=len(self._base_materials),
+                inputs=[self.latent_materials, self._base_materials],
+                outputs=[decoded_materials_tape],
+            )
+
+            # For some reason, Warp does not propagate adjoints through this struct->struct decode
+            # so we implement JVP manually here.
+            def _decode_backward():
+                wp.launch(
+                    kernel=decode_latent_grads,
+                    dim=len(self.latent_materials),
+                    inputs=[
+                        self.latent_materials,
+                        decoded_materials_tape.grad,
+                    ],
+                    outputs=[self.latent_materials.grad],
+                )
+
+            tape.record_func(
+                _decode_backward, [self.latent_materials, decoded_materials_tape]
+            )
+
+        # For primal (path-recording) rendering, just copy tape decode to a render buffer.
+        wp.copy(decoded_materials_render, decoded_materials_tape)
+
         for _ in range(self.renderer.max_iter):
+            # Primal rendering
+            self.renderer.materials = decoded_materials_render
             _, replay_data = self.renderer.render(record_path_replay_data=True)
+
+            # Replay rendering
+            self.renderer.materials = decoded_materials_tape
             with tape:
                 one_spp_radiances = self.renderer.replay(replay_data)
                 wp.launch(
@@ -319,24 +445,27 @@ class LearningSession:
             )
             self.current_loss = float(self.loss.numpy()[0])
 
+        # Track best params aligned with this loss (before optimizer step).
+        if self.loss_value < self.min_loss:
+            self.min_loss = self.loss_value
+            wp.copy(self.best_materials, decoded_materials_render)
+
         tape.backward(self.loss)
 
         wp.launch(
-            kernel=update_materials_adam,
-            dim=len(self.renderer.materials),
+            kernel=update_latent_materials_adam,
+            dim=len(self.latent_materials),
             inputs=[
                 self.learning_rate,
                 float(self._epoch + 1),
-                self.renderer.materials.grad,
-                self.renderer.materials,
+                self.latent_materials.grad,
+                self.latent_materials,
                 self._opt_m,
                 self._opt_v,
             ],
         )
 
-        if self.loss_value < self.min_loss:
-            self.min_loss = self.loss_value
-            wp.copy(self.best_materials, self.renderer.materials)
+        self.renderer.materials = prev_renderer_materials
 
         self._epoch += 1
         return self.loss_value
@@ -371,7 +500,10 @@ class LearningSession:
             delta[name] = best_np[name] - initial_np[name]
 
         logger.info("Min loss materials delta: %s", delta)
-        wp.copy(self.renderer.materials, self.best_materials)
+        # Apply best decoded materials back onto the renderer's base material buffer,
+        # then restore the renderer to use that buffer for non-learning rendering.
+        wp.copy(self._base_materials, self.best_materials)
+        self.renderer.materials = self._base_materials
         self._finalized = True
 
     # Context manager helpers to ensure finalize is called.
