@@ -17,7 +17,6 @@ from dataclasses import dataclass
 import logging
 import pathlib
 import time
-import imageio.v2 as imageio
 import numpy as np
 from pxr import Usd, UsdGeom, UsdShade
 
@@ -49,6 +48,7 @@ from material import (
     mat_pdf,
 )
 from learning import LearningSession
+from render_utils import tonemap, save_image, load_target_image
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -627,27 +627,6 @@ def accumulate(
     radiance[pixel_idx] = radiance_sum[pixel_idx] / float(num_samples)
 
 
-@wp.kernel
-def tonemap(
-    # Read
-    radiances: wp.array(dtype=wp.vec3),
-    # Write
-    pixels: wp.array(dtype=wp.vec3),
-):
-    tid = wp.tid()
-    pixel = radiances[tid]
-    pixel[0] /= 1.0 + pixel[0]
-    pixel[1] /= 1.0 + pixel[1]
-    pixel[2] /= 1.0 + pixel[2]
-
-    # gamma correction
-    p = 0.45454545454  # 1/2.2
-    pixel[0] = wp.clamp(wp.pow(wp.max(pixel[0], EPSILON), p), 0.0, 1.0)
-    pixel[1] = wp.clamp(wp.pow(wp.max(pixel[1], EPSILON), p), 0.0, 1.0)
-    pixel[2] = wp.clamp(wp.pow(wp.max(pixel[2], EPSILON), p), 0.0, 1.0)
-    pixels[tid] = pixel
-
-
 @dataclass
 class CameraParams:
     pos: tuple[float] = (0, 1, 2)
@@ -1050,74 +1029,6 @@ def log_frame_time_stats(frame_times: list[float], spp: int):
         min_ms,
         max_ms,
     )
-
-
-def save_image(
-    renderer: Renderer, path_arg: pathlib.Path | None, save_raw: bool = False
-):
-    """
-    Saves the current image to a directory. The filename matches the USD stage
-    name and the extension is selected via save_raw. If path_arg is None, the
-    repo root is used as the output directory. Returns the resolved output path
-    if saved, otherwise None.
-    """
-    extension = "hdr" if save_raw else "png"
-    stage_stem = (
-        renderer.usd_path.stem
-        if isinstance(getattr(renderer, "usd_path", None), pathlib.Path)
-        else "render"
-    )
-
-    output_dir = (path_arg or pathlib.Path(__file__).parent.parent).resolve()
-    output_path = (output_dir / f"{stage_stem}.{extension}").resolve()
-
-    pixels = renderer.get_pixels(use_tonemap=not save_raw)
-    pixels = pixels[::-1, ...]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if save_raw:
-        hdr_pixels = pixels.astype(np.float32)
-        imageio.imwrite(output_path.as_posix(), hdr_pixels, format="HDR-FI")
-    else:
-        imageio.imwrite(
-            output_path.as_posix(),
-            (pixels * 255.0).clip(0.0, 255.0).astype(np.uint8),
-        )
-
-
-def load_target_image(target_path: pathlib.Path, renderer: Renderer) -> np.ndarray:
-    """
-    Load and validate a target RGB image for learning/visualization.
-    Ensures shape/channel match and aligns orientation with the renderer output.
-    Only HDR inputs are accepted to avoid unintended 8-bit gamma/tonemap issues.
-    """
-    suffix = target_path.suffix.lower()
-    allowed_hdr_exts = {".hdr", ".exr"}
-    if suffix not in allowed_hdr_exts:
-        raise ValueError("Target image must be HDR.")
-
-    if suffix and suffix not in allowed_hdr_exts:
-        raise ValueError(
-            f"Target image must be HDR ({', '.join(sorted(allowed_hdr_exts))}); got {suffix or 'no extension'}."
-        )
-
-    img = imageio.imread(target_path)
-    if img.ndim == 2:
-        raise ValueError("Target image must be RGB, got grayscale.")
-    if img.shape[2] == 4:
-        img = img[..., :3]
-    if img.shape[2] != 3:
-        raise ValueError("Target image must have 3 channels (RGB).")
-
-    img = img.astype(np.float32)
-
-    if img.shape[0] != renderer.height or img.shape[1] != renderer.width:
-        raise ValueError(
-            f"Target image shape {img.shape[:2]} does not match renderer output "
-            f"({renderer.height}, {renderer.width})."
-        )
-
-    # Invert and flatten to match renderer's in-memory layout.
-    return img[::-1, ...].reshape(-1)
 
 
 def do_render_loop(
