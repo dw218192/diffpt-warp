@@ -1,12 +1,15 @@
 """
-Quick and dirty PBR exercise -- using Nvidia's warp library and Pixar's OpenUSD to implement a simple path tracer.
+Quick and dirty PBR & Differentiable Rendering Exercise
+-- using Nvidia's warp library and Pixar's OpenUSD.
+
+https://nvidia.github.io/warp/modules/functions.html
+
 Techniques:
     1. Progressive path tracing
     2. Multiple importance sampling/ Next Event Estimation using direct light sampling
     3. Russian Roulette for termination
     4. Monte Carlo integration
-
-https://nvidia.github.io/warp/modules/functions.html
+    5. Simple Path Replay Backpropagation for material parameter optimization
 """
 
 import contextlib
