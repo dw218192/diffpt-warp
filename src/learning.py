@@ -477,7 +477,7 @@ class LearningSession:
         return self.current_loss
 
     @property
-    def per_pixel_mse_host(self) -> np.ndarray:
+    def per_pixel_loss_host(self) -> np.ndarray:
         return self.per_pixel_loss.numpy().reshape(
             (self.renderer.height, self.renderer.width, 1)
         )

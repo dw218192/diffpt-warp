@@ -1481,7 +1481,7 @@ if __name__ == "__main__":
 
                         losses.append(session.loss_value)
                         render_image.set_data(renderer.get_pixels())
-                        ax_per_pixel_loss_image.set_data(session.per_pixel_mse_host)
+                        ax_per_pixel_loss_image.set_data(session.per_pixel_loss_host)
                         ax_per_pixel_loss_image.autoscale()
 
                         ax_total_loss_line.set_data(np.arange(len(losses)), losses)

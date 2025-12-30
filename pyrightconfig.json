@@ -1,0 +1,5 @@
+{
+    "venvPath": ".",
+    "venv": ".venv",
+    "typeCheckingMode": "off", // warp doesn't have good type hint support
+}
