@@ -182,27 +182,45 @@ def load_target_image(target_path: pathlib.Path, renderer: "Renderer") -> np.nda
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.description = "Convert an HDR image to a PNG image."
-    parser.add_argument(
-        "src_path", type=pathlib.Path, help="The path to the HDR image."
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    hdr_to_png_parser = subparsers.add_parser(
+        "hdr_to_png", help="Convert an HDR image (e.g. .hdr) to an 8-bit PNG."
+    )
+    hdr_to_png_parser.add_argument(
+        "src_path", type=pathlib.Path, help="Path to the HDR image to convert."
+    )
+    hdr_to_png_parser.add_argument(
         "-o",
         "--output-path",
         type=pathlib.Path,
-        help="The path to the output PNG image.",
+        default=None,
+        help="Output PNG path. Defaults to <src_path>.png",
     )
-    parser.add_argument(
+    hdr_to_png_parser.add_argument(
         "-f",
         "--flip-y",
         action="store_true",
         default=False,
         help="Flip the image vertically.",
     )
+    hdr_to_png_parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Optional Warp device override (e.g. 'cpu', 'cuda:0').",
+    )
 
     args = parser.parse_args()
-    if args.output_path is None:
-        args.output_path = args.src_path.with_suffix(".png")
 
-    hdr_to_png(args.src_path, args.output_path, flip_y=args.flip_y)
+    if args.subcommand == "hdr_to_png":
+        out = hdr_to_png(
+            args.src_path,
+            args.output_path,
+            flip_y=bool(args.flip_y),
+            device=args.device,
+        )
+        print(out.as_posix())

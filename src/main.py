@@ -1035,7 +1035,7 @@ def do_render_loop(
     renderer: Renderer,
     *,
     save_path: pathlib.Path | None,
-    save_raw: bool = False,
+    save_raw: bool = True,
     fig: plt.Figure | None = None,
     render_image: mpimg.AxesImage | None = None,
     label: plt.Text | None = None,
@@ -1139,9 +1139,9 @@ if __name__ == "__main__":
         help="Directory to save the rendered image; filename matches the USD stage.",
     )
     parser.add_argument(
-        "--save-raw",
+        "--save-png",
         action="store_true",
-        help="Save the raw radiance output as an HDR image.",
+        help="Save a tonemapped 8-bit PNG instead of the default raw HDR output.",
     )
     parser.add_argument(
         "--force-bvh",
@@ -1206,7 +1206,10 @@ if __name__ == "__main__":
             parser.error("--save-path points to a file; provide a directory.")
         args.save_path = args.save_path.resolve()
 
-    if args.save_raw:
+    # Default is HDR/raw when saving; PNG only on request.
+    save_raw = not args.save_png
+
+    if args.save_path and save_raw:
         # Ensure the HDR writer is available up front; fail fast if not.
         try:
             from imageio.plugins import freeimage
@@ -1240,9 +1243,7 @@ if __name__ == "__main__":
             logger.info("Running in headless mode (no UI).")
 
             if args.target_image is None:
-                do_render_loop(
-                    renderer, save_path=args.save_path, save_raw=args.save_raw
-                )
+                do_render_loop(renderer, save_path=args.save_path, save_raw=save_raw)
             else:
                 target_image = load_target_image(args.target_image, renderer)
                 with LearningSession(
@@ -1266,9 +1267,7 @@ if __name__ == "__main__":
                 # run a fresh render using the requested final spp
                 renderer.max_iter = args.final_spp
                 renderer.reset()
-                do_render_loop(
-                    renderer, save_path=args.save_path, save_raw=args.save_raw
-                )
+                do_render_loop(renderer, save_path=args.save_path, save_raw=save_raw)
         else:
             plt.ion()  # turn on interactive mode
             fig = plt.figure()
@@ -1328,7 +1327,7 @@ if __name__ == "__main__":
                 do_render_loop(
                     renderer,
                     save_path=args.save_path,
-                    save_raw=args.save_raw,
+                    save_raw=save_raw,
                     fig=fig,
                     render_image=render_image,
                     label=render_image_label,
@@ -1439,7 +1438,7 @@ if __name__ == "__main__":
                 do_render_loop(
                     renderer,
                     save_path=args.save_path,
-                    save_raw=args.save_raw,
+                    save_raw=save_raw,
                     fig=fig,
                     render_image=render_image,
                     label=render_image_label,
