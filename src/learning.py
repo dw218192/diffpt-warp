@@ -29,6 +29,8 @@ ALPHA_MAX = 1.0
 GRAD_CLIP_NORM = 10.0
 GRAD_CLIP_EPS = 1e-8
 
+HUBER_DELTA = 0.1
+
 # Latent-space mapping safety.
 # Keeping decode away from exact {0,1} reduces saturation (tiny sigmoid' gradients).
 _LATENT_EPS = 1e-4
@@ -52,21 +54,27 @@ def _compute_loss_kernel(
     num_pixels: int,
     radiance_sum: wp.array(dtype=wp.vec3),
     target_image: wp.array(dtype=wp.vec3),
+    huber_delta: float,
     # Write
     loss: wp.array(dtype=wp.float32),
     per_pixel_loss: wp.array(dtype=wp.float32),
 ):
     """
-    Calculates the L1 loss between the current image and the target image.
+    Calculates a per-pixel Huber loss between the current image and the target image.
+    The loss is summed across RGB channels, then summed across pixels.
     """
     tid = wp.tid()
 
     predicted = radiance_sum[tid] / float(num_samples)
     target = target_image[tid]
     diff = predicted - target
-    abs_diff = wp.abs(diff[0]) + wp.abs(diff[1]) + wp.abs(diff[2])
-    per_pixel_loss[tid] = abs_diff
-    wp.atomic_add(loss, 0, abs_diff)
+    l = (
+        pseudo_huber(diff[0], huber_delta)
+        + pseudo_huber(diff[1], huber_delta)
+        + pseudo_huber(diff[2], huber_delta)
+    )
+    per_pixel_loss[tid] = l
+    wp.atomic_add(loss, 0, l)
 
 
 @wp.func
@@ -93,6 +101,21 @@ def inv_bounded_sigmoid01(p: float, eps: float) -> float:
     p = wp.min(wp.max(p, eps), 1.0 - eps)
     q = (p - eps) / (1.0 - 2.0 * eps)  # in [0,1]
     return logit01(q, eps)
+
+
+@wp.func
+def pseudo_huber(x: float, delta: float) -> float:
+    """
+    Smooth approximation to Huber / Smooth L1 (a.k.a. pseudo-Huber):
+
+        delta^2 * (sqrt(1 + (x/delta)^2) - 1)
+
+    - Quadratic near 0 (like L2)
+    - Linear for large |x| (like L1)
+    """
+    # delta is expected > 0; treat as a hyperparameter.
+    t = x / delta
+    return delta * delta * (wp.sqrt(1.0 + t * t) - 1.0)
 
 
 @wp.kernel
@@ -282,6 +305,7 @@ def compute_loss(
     num_pixels: int,
     radiance_sum: wp.array(dtype=wp.vec3),
     target_image: wp.array(dtype=wp.vec3),
+    huber_delta: float,
     per_pixel_loss: wp.array(dtype=wp.float32),
     loss: wp.array(dtype=wp.float32),
 ):
@@ -293,6 +317,7 @@ def compute_loss(
             num_pixels,
             radiance_sum,
             target_image,
+            huber_delta,
         ],
         outputs=[
             loss,
@@ -470,6 +495,7 @@ class LearningSession:
                 num_pixels,
                 radiance_sum,
                 self.target_image,
+                HUBER_DELTA,
                 self.per_pixel_loss,
                 self.loss,
             )
