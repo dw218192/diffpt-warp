@@ -660,10 +660,10 @@ class Renderer:
         - The USD file must contain at least one material.
         - Non-triangular or degenerate faces are not supported.
         - Only implements USD material binding API, activeness
-            - Material format is custom, not UsdShade
+            - (Partially) preview surface schema
             - No support for UsdLux
         - Lights can only be
-            - meshes with UsdLux.MeshLightAPI
+            - Meshes with UsdLux.MeshLightAPI
             - UsdLux.RectLight
     """
 
