@@ -25,6 +25,10 @@ ADAM_EPS = 1e-8
 ALPHA_MIN = float(GGX_MIN_ALPHA)
 ALPHA_MAX = 1.0
 
+# Gradient clipping (global L2 norm) for stability under noisy/low-SPP gradients.
+GRAD_CLIP_NORM = 10.0
+GRAD_CLIP_EPS = 1e-8
+
 # Latent-space mapping safety.
 # Keeping decode away from exact {0,1} reduces saturation (tiny sigmoid' gradients).
 _LATENT_EPS = 1e-4
@@ -477,6 +481,20 @@ class LearningSession:
             wp.copy(self.best_materials, decoded_materials_render)
 
         tape.backward(self.loss)
+
+        # --- Gradient clipping (global norm) ---
+        if GRAD_CLIP_NORM > 0.0:
+            g_np = self.latent_materials.grad.numpy()
+            norm2 = 0.0
+            for name in g_np.dtype.names:
+                arr = np.asarray(g_np[name], dtype=np.float64)
+                norm2 += float(np.sum(arr * arr))
+            norm = float(np.sqrt(norm2))
+            if norm > GRAD_CLIP_NORM:
+                scale = float(GRAD_CLIP_NORM / (norm + GRAD_CLIP_EPS))
+                for name in g_np.dtype.names:
+                    g_np[name] *= scale
+                wp.copy(self.latent_materials.grad, wp.array(g_np, dtype=Material))
 
         wp.launch(
             kernel=update_latent_materials_adam,

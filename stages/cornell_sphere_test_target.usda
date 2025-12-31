@@ -74,7 +74,7 @@ over "geo"
         {
             over "Sphere"
             {
-                rel material:binding = </Materials/diffuse_green>
+                rel material:binding = </Materials/oxidized_metal_red>
             }
         }
     }

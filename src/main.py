@@ -1190,7 +1190,7 @@ if __name__ == "__main__":
     diffrt_group.add_argument(
         "--resample-interval",
         type=int,
-        default=0,
+        default=20,
         help="If >0, change the RNG seed every N learning epochs (helps escape fixed-sample plateaus). 0 disables reseeding.",
     )
 
