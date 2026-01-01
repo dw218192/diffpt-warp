@@ -689,6 +689,9 @@ class Renderer:
         # underlying Warp meshes are garbage-collected.
         self._wp_meshes: list[wp.Mesh] = []
 
+        # for debugging/information only
+        self._mesh_names: list[str] = []
+
         meshes_list: list[Mesh] = []
         light_indices_list: list[int] = []
         materials_list: list[Material] = []
@@ -738,6 +741,9 @@ class Renderer:
                 meshes_list.append(mesh)
                 if mesh.is_light:
                     light_indices_list.append(len(meshes_list) - 1)
+
+                # get mesh name from the top-level prim name that is not the root prim
+                self._mesh_names.append(str(prim.GetPrimPath()))
 
         # When doing differentiable rendering, material sharing can make the target
         # image impossible to fit (multiple meshes coupled through a shared parameter
@@ -847,7 +853,15 @@ class Renderer:
     def num_iter(self):
         return self._num_iter
 
-    def render(self, record_path_replay_data: bool = False) -> tuple[bool, ReplayData]:
+    def get_mesh_name_from_material_id(self, material_id: int) -> str:
+        for mesh_id, mesh in enumerate(self._meshes.numpy()):
+            if mesh["material_id"] == material_id:
+                return self._mesh_names[mesh_id]
+        return "<unknown>"
+
+    def render(
+        self, *, record_path_replay_data: bool = False, print_info=True
+    ) -> tuple[bool, ReplayData]:
         """
         Render a single iteration of the path tracer.
         If record_path_replay_data is True, extra data will be recorded to allow path replay backpropagation.
@@ -871,7 +885,7 @@ class Renderer:
         if self._num_iter >= self.max_iter:
             return False, replay_data
 
-        with wp.ScopedTimer("render single iteration") as timer:
+        with wp.ScopedTimer("render single iteration", print=print_info) as timer:
             timer.extra_msg = f"iteration {self._num_iter + 1}/{self.max_iter}"
             wp.launch(
                 kernel=init_path_segments,

@@ -606,7 +606,9 @@ class LearningSession:
         for _ in range(self.renderer.max_iter):
             # Primal rendering
             self.renderer.materials = decoded_materials_render
-            _, replay_data = self.renderer.render(record_path_replay_data=True)
+            _, replay_data = self.renderer.render(
+                record_path_replay_data=True, print_info=False
+            )
 
             # Replay rendering
             self.renderer.materials = decoded_materials_tape
@@ -707,13 +709,23 @@ class LearningSession:
         else:
             logger.info("No learning steps were executed.")
 
-        delta = {}
         best_np = self.best_materials.numpy()
         initial_np = self.initial_materials.numpy()
-        for name in best_np.dtype.names:
-            delta[name] = best_np[name] - initial_np[name]
 
-        logger.info("Min loss materials delta: %s", delta)
+        def _fmt_val(v):
+            return np.asarray(v).tolist()
+
+        lines = ["Materials summary (before -> after | delta):"]
+        for mat_id in range(len(best_np)):
+            mesh_name = self.renderer.get_mesh_name_from_material_id(mat_id)
+            lines.append(f"  [{mat_id}] mesh='{mesh_name}'")
+            for field in best_np.dtype.names:
+                before = _fmt_val(initial_np[field][mat_id])
+                after = _fmt_val(best_np[field][mat_id])
+                delta = _fmt_val(best_np[field][mat_id] - initial_np[field][mat_id])
+                lines.append(f"    {field}: {before} -> {after} | Δ={delta}")
+        logger.info("\n".join(lines))
+
         # Restore renderer SPP to the training maximum; caller may override for final renders.
         self.renderer.max_iter = self._train_spp_max
         # Apply best decoded materials back onto the renderer's base material buffer,
