@@ -77,6 +77,69 @@ def _compute_loss_kernel(
     wp.atomic_add(loss, 0, l)
 
 
+@wp.kernel
+def _gaussian_blur3x3(
+    width: int,
+    height: int,
+    # Read
+    src: wp.array(dtype=wp.vec3),
+    # Write
+    dst: wp.array(dtype=wp.vec3),
+):
+    """
+    Lightweight 3x3 Gaussian blur with weights [[1,2,1],[2,4,2],[1,2,1]] / 16.
+    """
+    tid = wp.tid()
+    x = tid % width
+    y = tid // width
+
+    acc = wp.vec3(0.0)
+    w_sum = 0.0
+
+    # y - 1
+    if y > 0 and x > 0:
+        w = 1.0
+        acc += src[(y - 1) * width + (x - 1)] * w
+        w_sum += w
+    if y > 0:
+        w = 2.0
+        acc += src[(y - 1) * width + x] * w
+        w_sum += w
+    if y > 0 and x + 1 < width:
+        w = 1.0
+        acc += src[(y - 1) * width + (x + 1)] * w
+        w_sum += w
+
+    # y
+    if x > 0:
+        w = 2.0
+        acc += src[y * width + (x - 1)] * w
+        w_sum += w
+    w = 4.0
+    acc += src[tid] * w
+    w_sum += w
+    if x + 1 < width:
+        w = 2.0
+        acc += src[y * width + (x + 1)] * w
+        w_sum += w
+
+    # y + 1
+    if y + 1 < height and x > 0:
+        w = 1.0
+        acc += src[(y + 1) * width + (x - 1)] * w
+        w_sum += w
+    if y + 1 < height:
+        w = 2.0
+        acc += src[(y + 1) * width + x] * w
+        w_sum += w
+    if y + 1 < height and x + 1 < width:
+        w = 1.0
+        acc += src[(y + 1) * width + (x + 1)] * w
+        w_sum += w
+
+    dst[tid] = acc / w_sum
+
+
 @wp.func
 def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + wp.exp(-x))
@@ -119,7 +182,7 @@ def pseudo_huber(x: float, delta: float) -> float:
 
 
 @wp.kernel
-def init_latent_from_materials(
+def encode_materials(
     # Read
     materials: wp.array(dtype=Material),
     # Write
@@ -346,10 +409,10 @@ class LearningSession:
         self.learning_rate = learning_rate
         self._max_epochs = max_epochs
         self._epoch = 0
-        self._rng_seed = int(rng_seed)
+        self._rng_seed = rng_seed
         if self._rng_seed < 0:
             raise ValueError(f"rng_seed must be >= 0; got {self._rng_seed}")
-        self._resample_interval = int(resample_interval)
+        self._resample_interval = resample_interval
         if self._resample_interval < 0:
             raise ValueError(
                 f"resample_interval must be >= 0 (0 disables reseeding); got {self._resample_interval}"
@@ -366,14 +429,25 @@ class LearningSession:
             raise ValueError(
                 f"Unexpected target_image shape {target_image.shape}; expected a flat (N,) float array."
             )
-        expected_len = int(renderer.width * renderer.height * 3)
-        if int(target_image.shape[0]) != expected_len:
+        expected_len = renderer.width * renderer.height * 3
+        if target_image.shape[0] != expected_len:
             raise ValueError(
                 f"Unexpected target_image length {target_image.shape[0]}; expected {expected_len} (=W*H*3)."
             )
         self.target_image = wp.array(
             target_image.reshape((-1, 3)),
             dtype=wp.vec3,
+        )
+        self._blurred_target = wp.zeros_like(self.target_image)
+        wp.launch(
+            kernel=_gaussian_blur3x3,
+            dim=renderer.width * renderer.height,
+            inputs=[
+                renderer.width,
+                renderer.height,
+                self.target_image,
+            ],
+            outputs=[self._blurred_target],
         )
 
         self.min_loss = float("inf")
@@ -386,7 +460,7 @@ class LearningSession:
         # Latent parameterization: optimize an unconstrained buffer, decode -> renderer.materials.
         self.latent_materials = wp.zeros_like(self._base_materials, requires_grad=True)
         wp.launch(
-            kernel=init_latent_from_materials,
+            kernel=encode_materials,
             dim=len(self._base_materials),
             inputs=[
                 self._base_materials,
@@ -427,6 +501,7 @@ class LearningSession:
         self.latent_materials.grad.zero_()
 
         radiance_sum = wp.zeros(num_pixels, dtype=wp.vec3, requires_grad=True)
+        blurred_radiance_sum = wp.zeros_like(radiance_sum, requires_grad=True)
 
         tape = wp.Tape()
         with tape:
@@ -467,7 +542,7 @@ class LearningSession:
 
         # Primal rendering uses internal accumulation buffers; reset at the start of the epoch.
         self.renderer.reset()
-        self.renderer.rng_seed = int(seed_epoch)
+        self.renderer.rng_seed = seed_epoch
 
         for _ in range(self.renderer.max_iter):
             # Primal rendering
@@ -490,11 +565,21 @@ class LearningSession:
                 )
 
         with tape:
+            wp.launch(
+                kernel=_gaussian_blur3x3,
+                dim=num_pixels,
+                inputs=[
+                    self.renderer.width,
+                    self.renderer.height,
+                    radiance_sum,
+                ],
+                outputs=[blurred_radiance_sum],
+            )
             compute_loss(
                 self.renderer.max_iter,
                 num_pixels,
-                radiance_sum,
-                self.target_image,
+                blurred_radiance_sum,
+                self._blurred_target,
                 HUBER_DELTA,
                 self.per_pixel_loss,
                 self.loss,
