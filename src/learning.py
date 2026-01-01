@@ -22,8 +22,8 @@ ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-8
 
-ALPHA_MIN = float(GGX_MIN_ALPHA)
-ALPHA_MAX = 1.0
+ALPHA_MIN = GGX_MIN_ALPHA
+ALPHA_MAX = 0.98  # avoid sigmoid saturation at 1.0
 
 # Gradient clipping (global L2 norm) for stability under noisy/low-SPP gradients.
 GRAD_CLIP_NORM = 10.0
@@ -205,8 +205,8 @@ def encode_materials(
 
     # roughness: [roughness_min, roughness_max] -> logit of normalized
     # We optimize GGX alpha = roughness^2 (what the BSDF actually uses).
-    # Clamp alpha to GGX_MIN_ALPHA to match the BSDF behavior and avoid non-identifiability.
-    alpha = wp.max(m.roughness * m.roughness, float(ALPHA_MIN))
+    # Clamp to [ALPHA_MIN, ALPHA_MAX] to mirror BSDF clamping and avoid saturation.
+    alpha = wp.clamp(m.roughness * m.roughness, ALPHA_MIN, ALPHA_MAX)
     inv_range = 1.0 / (ALPHA_MAX - ALPHA_MIN)
     an = (alpha - ALPHA_MIN) * inv_range
     z.roughness = logit01(an, _LATENT_EPS)
