@@ -23,6 +23,7 @@ from pxr import Usd, UsdGeom, UsdShade
 import warp as wp
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
+from matplotlib.animation import FFMpegWriter
 
 from usd_utils import extract_pos
 from warp_math_utils import (
@@ -1031,6 +1032,40 @@ def log_frame_time_stats(frame_times: list[float], spp: int):
     )
 
 
+def get_stage_file_name(renderer: Renderer) -> str:
+    usd_path = getattr(renderer, "usd_path", None)
+    if isinstance(usd_path, pathlib.Path):
+        return usd_path.stem
+    return "render"
+
+
+@contextlib.contextmanager
+def maybe_video_writer(
+    fig: plt.Figure | None,
+    enable: bool,
+    output_path: pathlib.Path,
+    *,
+    fps: int = 30,
+    dpi: int = 100,
+):
+    writer: FFMpegWriter | None = None
+    if enable and fig is not None:
+        if not FFMpegWriter.isAvailable():
+            logger.warning("FFmpeg not available on PATH; skipping video capture.")
+        else:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            writer = FFMpegWriter(fps=fps, metadata={"title": output_path.stem})
+            try:
+                with writer.saving(fig, output_path.as_posix(), dpi=dpi):
+                    logger.info("Recording matplotlib frames to %s", output_path)
+                    yield writer
+                    return
+            except Exception as exc:
+                logger.warning("Failed to start video capture: %s", exc)
+                writer = None
+    yield writer
+
+
 def do_render_loop(
     renderer: Renderer,
     *,
@@ -1040,6 +1075,7 @@ def do_render_loop(
     render_image: mpimg.AxesImage | None = None,
     label: plt.Text | None = None,
     replay_image: mpimg.AxesImage | None = None,
+    video_writer: FFMpegWriter | None = None,
 ):
     @wp.kernel
     def _accumulate_replay(
@@ -1068,9 +1104,7 @@ def do_render_loop(
                 record_path_replay_data=debug_replay
             )
         frame_ms = info["elapsed"] * 1000.0
-        if save_path and not can_continue:
-            save_image(renderer, save_path, save_raw=save_raw)
-            break
+        should_save_final = bool(save_path and not can_continue)
 
         if render_image:
             render_image.set_data(renderer.get_pixels())
@@ -1099,9 +1133,13 @@ def do_render_loop(
         if fig:
             fig.canvas.draw()
             fig.canvas.flush_events()
+            if video_writer:
+                video_writer.grab_frame()
 
         if label:
             label.set_text(f"Iteration: {renderer.num_iter} ({frame_ms:.1f} ms)")
+        if should_save_final:
+            save_image(renderer, save_path, save_raw=save_raw)
         if not can_continue:
             break
 
@@ -1142,6 +1180,20 @@ if __name__ == "__main__":
         "--save-png",
         action="store_true",
         help="Save a tonemapped 8-bit PNG instead of the default raw HDR output.",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=str,
+        default=None,
+        help="Matplotlib window size in pixels, format WxH (e.g., 1280x720). UI mode only.",
+    )
+    parser.add_argument(
+        "--capture-video",
+        action="store_true",
+        help=(
+            "Capture the matplotlib UI to MP4 when a window is shown; saved next to "
+            "--save-path (requires ffmpeg). Ignored in headless mode."
+        ),
     )
     parser.add_argument(
         "--force-bvh",
@@ -1216,6 +1268,9 @@ if __name__ == "__main__":
     # Default is HDR/raw when saving; PNG only on request.
     save_raw = not args.save_png
 
+    if args.capture_video and args.headless:
+        logger.warning("--capture-video requested but --headless is set; skipping.")
+
     if args.save_path and save_raw:
         # Ensure the HDR writer is available up front; fail fast if not.
         try:
@@ -1249,10 +1304,29 @@ if __name__ == "__main__":
         )
 
         # Helpers to parse ranges of form "min:max"
-        def _parse_range(spec: str, cast, name: str, check_order: bool = True):
-            parts = spec.split(":")
+        def _parse_range(
+            spec: str,
+            cast,
+            name: str,
+            *,
+            separators=(":"),
+            check_order: bool = True,
+        ):
+            seps = (
+                separators if isinstance(separators, (list, tuple)) else (separators,)
+            )
+            for sep in seps:
+                if sep in spec:
+                    parts = spec.split(sep)
+                    break
+            else:
+                parser.error(
+                    f"{name} must be in form a{seps[0]}b; got '{spec}' (separators: {seps})"
+                )
             if len(parts) != 2:
-                parser.error(f"{name} must be in form a:b; got '{spec}'")
+                parser.error(
+                    f"{name} must be in form a{seps[0]}b; got '{spec}' (separators: {seps})"
+                )
             try:
                 lo = cast(parts[0])
                 hi = cast(parts[1])
@@ -1319,7 +1393,19 @@ if __name__ == "__main__":
                 do_render_loop(renderer, save_path=args.save_path, save_raw=save_raw)
         else:
             plt.ion()  # turn on interactive mode
-            fig = plt.figure()
+            fig_kwargs = {}
+            if args.window_size:
+                win_w, win_h = _parse_range(
+                    args.window_size,
+                    int,
+                    "--window-size",
+                    separators=("x", "X", ","),
+                    check_order=False,
+                )
+                dpi_default = float(plt.rcParams.get("figure.dpi", 100))
+                fig_kwargs["figsize"] = (win_w / dpi_default, win_h / dpi_default)
+                fig_kwargs["dpi"] = dpi_default
+            fig = plt.figure(**fig_kwargs)
 
             def handle_close(_):
                 global g_running
@@ -1327,175 +1413,197 @@ if __name__ == "__main__":
 
             fig.canvas.mpl_connect("close_event", handle_close)
 
-            # main loop
-            if args.target_image is None:
-                # if debug mode is enabled, add a "replay image", i.e. the image generated by replaying the paths.
-                if args.debug:
-                    gs = fig.add_gridspec(1, 2, width_ratios=[1, 1])
-                    ax = fig.add_subplot(gs[0, 0])
-                    ax_replay = fig.add_subplot(gs[0, 1])
-                    ax_replay.set_title("Replay (debug)")
-                    ax_replay.set_axis_off()
-                    replay_image = ax_replay.imshow(
+            video_output_dir = (
+                args.save_path or pathlib.Path(__file__).parent.parent
+            ).resolve()
+            video_output_path = (
+                video_output_dir / f"{get_stage_file_name(renderer)}.mp4"
+            )
+
+            with maybe_video_writer(
+                fig,
+                enable=args.capture_video,
+                output_path=video_output_path,
+                fps=30,
+                dpi=int(getattr(fig, "dpi", 100)),
+            ) as video_writer:
+                # main loop
+                if args.target_image is None:
+                    # if debug mode is enabled, add a "replay image", i.e. the image generated by replaying the paths.
+                    if args.debug:
+                        gs = fig.add_gridspec(1, 2, width_ratios=[1, 1])
+                        ax = fig.add_subplot(gs[0, 0])
+                        ax_replay = fig.add_subplot(gs[0, 1])
+                        ax_replay.set_title("Replay (debug)")
+                        ax_replay.set_axis_off()
+                        replay_image = ax_replay.imshow(
+                            np.zeros((renderer.height, renderer.width, 3)),
+                            origin="lower",
+                            interpolation="antialiased",
+                            aspect="equal",
+                        )
+                        plt.subplots_adjust(
+                            left=0, right=1, top=1, bottom=0, wspace=0.05
+                        )
+                    else:
+                        ax = fig.add_subplot()
+                        replay_image = None
+                        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+                    # layout
+                    ax.set_title("PBR Renderer")
+                    ax.set_axis_off()
+
+                    render_image = ax.imshow(
                         np.zeros((renderer.height, renderer.width, 3)),
                         origin="lower",
                         interpolation="antialiased",
                         aspect="equal",
                     )
-                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0, wspace=0.05)
+
+                    # add label in top-left corner
+                    render_image_label = ax.text(
+                        0.01,
+                        0.99,
+                        "Iteration: 0",
+                        color="white",
+                        fontsize=9,
+                        ha="left",
+                        va="top",
+                        transform=ax.transAxes,  # coordinates relative to axes (0–1)
+                    )
+                    plt.show(block=False)
+
+                    # normal rendering loop
+                    do_render_loop(
+                        renderer,
+                        save_path=args.save_path,
+                        save_raw=save_raw,
+                        fig=fig,
+                        render_image=render_image,
+                        label=render_image_label,
+                        replay_image=replay_image,
+                        video_writer=video_writer,
+                    )
                 else:
-                    ax = fig.add_subplot()
-                    replay_image = None
-                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+                    target_image = load_target_image(args.target_image, renderer)
+                    target_radiances_wp = wp.array(
+                        target_image.reshape((-1, 3)), dtype=wp.vec3
+                    )
+                    target_pixels_wp = wp.zeros(
+                        renderer.width * renderer.height, dtype=wp.vec3
+                    )
+                    wp.launch(
+                        kernel=tonemap,
+                        dim=renderer.width * renderer.height,
+                        inputs=[target_radiances_wp],
+                        outputs=[target_pixels_wp],
+                    )
+                    target_pixels_tm = target_pixels_wp.numpy().reshape(
+                        (renderer.height, renderer.width, 3)
+                    )
 
-                # layout
-                ax.set_title("PBR Renderer")
-                ax.set_axis_off()
+                    # layout with target, render, per-pixel loss heatmap, and total loss curve
+                    gs = fig.add_gridspec(2, 2)
 
-                render_image = ax.imshow(
-                    np.zeros((renderer.height, renderer.width, 3)),
-                    origin="lower",
-                    interpolation="antialiased",
-                    aspect="equal",
-                )
+                    ax_target = fig.add_subplot(gs[0, 0])
+                    ax_target.set_title("Target")
+                    ax_target.set_axis_off()
+                    ax_target.imshow(
+                        target_pixels_tm,
+                        origin="lower",
+                        interpolation="antialiased",
+                        aspect="equal",
+                    )
 
-                # add label in top-left corner
-                render_image_label = ax.text(
-                    0.01,
-                    0.99,
-                    "Iteration: 0",
-                    color="white",
-                    fontsize=9,
-                    ha="left",
-                    va="top",
-                    transform=ax.transAxes,  # coordinates relative to axes (0–1)
-                )
-                plt.show(block=False)
+                    ax_render = fig.add_subplot(gs[0, 1])
+                    ax_render.set_title("Render")
+                    ax_render.set_axis_off()
+                    render_image = ax_render.imshow(
+                        np.zeros((renderer.height, renderer.width, 3)),
+                        origin="lower",
+                        interpolation="antialiased",
+                        aspect="equal",
+                    )
+                    render_image_label = ax_render.text(
+                        0.01,
+                        0.99,
+                        "Epoch: 0",
+                        color="white",
+                        fontsize=9,
+                        ha="left",
+                        va="top",
+                        transform=ax_render.transAxes,
+                    )
 
-                # normal rendering loop
-                do_render_loop(
-                    renderer,
-                    save_path=args.save_path,
-                    save_raw=save_raw,
-                    fig=fig,
-                    render_image=render_image,
-                    label=render_image_label,
-                    replay_image=replay_image,
-                )
-            else:
-                target_image = load_target_image(args.target_image, renderer)
-                target_radiances_wp = wp.array(
-                    target_image.reshape((-1, 3)), dtype=wp.vec3
-                )
-                target_pixels_wp = wp.zeros(
-                    renderer.width * renderer.height, dtype=wp.vec3
-                )
-                wp.launch(
-                    kernel=tonemap,
-                    dim=renderer.width * renderer.height,
-                    inputs=[target_radiances_wp],
-                    outputs=[target_pixels_wp],
-                )
-                target_pixels_tm = target_pixels_wp.numpy().reshape(
-                    (renderer.height, renderer.width, 3)
-                )
+                    ax_per_pixel_loss = fig.add_subplot(gs[1, 0])
+                    ax_per_pixel_loss.set_title("Per-pixel Loss")
+                    ax_per_pixel_loss.set_axis_off()
+                    ax_per_pixel_loss_image = ax_per_pixel_loss.imshow(
+                        np.zeros((renderer.height, renderer.width, 1)),
+                        origin="lower",
+                        interpolation="antialiased",
+                        aspect="equal",
+                        cmap="viridis",
+                    )
 
-                # layout with target, render, per-pixel loss heatmap, and total loss curve
-                gs = fig.add_gridspec(2, 2)
+                    ax_total_loss = fig.add_subplot(gs[1, 1])
+                    ax_total_loss.set_title("Total Loss")
+                    ax_total_loss.set_xlabel("Epoch")
+                    ax_total_loss.set_ylabel("Loss")
+                    (ax_total_loss_line,) = ax_total_loss.plot([], [])
 
-                ax_target = fig.add_subplot(gs[0, 0])
-                ax_target.set_title("Target")
-                ax_target.set_axis_off()
-                ax_target.imshow(
-                    target_pixels_tm,
-                    origin="lower",
-                    interpolation="antialiased",
-                    aspect="equal",
-                )
+                    plt.show(block=False)
+                    losses = []
 
-                ax_render = fig.add_subplot(gs[0, 1])
-                ax_render.set_title("Render")
-                ax_render.set_axis_off()
-                render_image = ax_render.imshow(
-                    np.zeros((renderer.height, renderer.width, 3)),
-                    origin="lower",
-                    interpolation="antialiased",
-                    aspect="equal",
-                )
-                render_image_label = ax_render.text(
-                    0.01,
-                    0.99,
-                    "Epoch: 0",
-                    color="white",
-                    fontsize=9,
-                    ha="left",
-                    va="top",
-                    transform=ax_render.transAxes,
-                )
+                    with LearningSession(
+                        renderer,
+                        target_image=target_image,
+                        learning_rate=lr,
+                        learning_rate_final=lr_final,
+                        max_epochs=args.num_epochs,
+                        rng_seed=args.rng_seed,
+                        resample_interval=args.resample_interval,
+                        min_spp=spp_min,
+                        max_spp=spp_max,
+                    ) as session:
+                        while g_running:
+                            loss = session.step()
+                            if loss is None:
+                                break
 
-                ax_per_pixel_loss = fig.add_subplot(gs[1, 0])
-                ax_per_pixel_loss.set_title("Per-pixel Loss")
-                ax_per_pixel_loss.set_axis_off()
-                ax_per_pixel_loss_image = ax_per_pixel_loss.imshow(
-                    np.zeros((renderer.height, renderer.width, 1)),
-                    origin="lower",
-                    interpolation="antialiased",
-                    aspect="equal",
-                    cmap="viridis",
-                )
+                            losses.append(session.loss_value)
+                            render_image.set_data(renderer.get_pixels())
+                            ax_per_pixel_loss_image.set_data(
+                                session.per_pixel_loss_host
+                            )
+                            ax_per_pixel_loss_image.autoscale()
 
-                ax_total_loss = fig.add_subplot(gs[1, 1])
-                ax_total_loss.set_title("Total Loss")
-                ax_total_loss.set_xlabel("Epoch")
-                ax_total_loss.set_ylabel("Loss")
-                (ax_total_loss_line,) = ax_total_loss.plot([], [])
+                            ax_total_loss_line.set_data(np.arange(len(losses)), losses)
+                            ax_total_loss.relim()
+                            ax_total_loss.autoscale_view()
 
-                plt.show(block=False)
-                losses = []
+                            render_image_label.set_text(
+                                f"Epoch: {session.epoch}/{session.max_epochs}  "
+                                f"Loss: {session.loss_value:.4f}  "
+                                f"LR: {session.current_lr:.4g}  "
+                                f"SPP: {session.current_spp}"
+                            )
+                            fig.canvas.draw()
+                            fig.canvas.flush_events()
+                            if video_writer:
+                                video_writer.grab_frame()
 
-                with LearningSession(
-                    renderer,
-                    target_image=target_image,
-                    learning_rate=lr,
-                    learning_rate_final=lr_final,
-                    max_epochs=args.num_epochs,
-                    rng_seed=args.rng_seed,
-                    resample_interval=args.resample_interval,
-                    min_spp=spp_min,
-                    max_spp=spp_max,
-                ) as session:
-                    while g_running:
-                        loss = session.step()
-                        if loss is None:
-                            break
-
-                        losses.append(session.loss_value)
-                        render_image.set_data(renderer.get_pixels())
-                        ax_per_pixel_loss_image.set_data(session.per_pixel_loss_host)
-                        ax_per_pixel_loss_image.autoscale()
-
-                        ax_total_loss_line.set_data(np.arange(len(losses)), losses)
-                        ax_total_loss.relim()
-                        ax_total_loss.autoscale_view()
-
-                        render_image_label.set_text(
-                            f"Epoch: {session.epoch}/{session.max_epochs}  "
-                            f"Loss: {session.loss_value:.4f}  "
-                            f"LR: {session.current_lr:.4g}  "
-                            f"SPP: {session.current_spp}"
-                        )
-                        fig.canvas.draw()
-                        fig.canvas.flush_events()
-
-                # run a fresh render using the requested spp
-                renderer.max_iter = args.spp
-                renderer.reset()
-                do_render_loop(
-                    renderer,
-                    save_path=args.save_path,
-                    save_raw=save_raw,
-                    fig=fig,
-                    render_image=render_image,
-                    label=render_image_label,
-                )
+                    # run a fresh render using the requested spp
+                    renderer.max_iter = args.spp
+                    renderer.reset()
+                    do_render_loop(
+                        renderer,
+                        save_path=args.save_path,
+                        save_raw=save_raw,
+                        fig=fig,
+                        render_image=render_image,
+                        label=render_image_label,
+                        video_writer=video_writer,
+                    )
             plt.close()
