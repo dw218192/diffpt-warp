@@ -401,12 +401,36 @@ class LearningSession:
         *,
         target_image: np.ndarray,
         learning_rate: float,
+        learning_rate_final: Optional[float] = None,
         max_epochs: int,
         rng_seed: int = 0,
         resample_interval: int = 0,
+        min_spp: int = 1,
+        max_spp: Optional[int] = None,
     ):
         self.renderer = renderer
-        self.learning_rate = learning_rate
+        self._lr_start = learning_rate
+        if self._lr_start <= 0.0:
+            raise ValueError(f"learning_rate must be > 0; got {self._lr_start}")
+        lr_final = learning_rate_final
+        if lr_final is None:
+            lr_final = 0.1 * self._lr_start
+        if lr_final <= 0.0:
+            raise ValueError(
+                f"learning_rate_final must be > 0; got {lr_final} (before clamping)"
+            )
+        # Allow either direction (most cases decrease); scheduler interpolates between endpoints.
+        self._lr_final = lr_final
+        self.learning_rate = self._lr_start  # mutable, updated by scheduler
+
+        # Samples-per-pixel schedule bounds.
+        spp_cap = max_spp if max_spp is not None else renderer.max_iter
+        if spp_cap <= 0:
+            raise ValueError(f"max_spp must be > 0; got {spp_cap}")
+        self._train_spp_max = spp_cap
+        self._train_spp_min = max(1, min(min_spp, self._train_spp_max))
+        self._current_spp = self._train_spp_min
+
         self._max_epochs = max_epochs
         self._epoch = 0
         self._rng_seed = rng_seed
@@ -478,6 +502,37 @@ class LearningSession:
     def max_epochs(self) -> int:
         return self._max_epochs
 
+    @property
+    def current_lr(self) -> float:
+        return float(self.learning_rate)
+
+    @property
+    def current_spp(self) -> int:
+        return int(self._current_spp)
+
+    def _schedule_epoch(self) -> tuple[float, int]:
+        """
+        Smoothly decay LR while ramping SPP:
+        - start with higher LR and few SPP to chase low frequencies fast
+        - end with lower LR and more SPP for fine details
+        """
+        # progress in [0,1]
+        denom = max(1, self._max_epochs - 1)
+        progress = min(1.0, self._epoch / denom)
+
+        # Ease-out LR decay (quadratic) for stability near the end.
+        lr = self._lr_final + (self._lr_start - self._lr_final) * (1.0 - progress) ** 2
+
+        # Ease-in SPP ramp (quadratic) to spend more effort later.
+        spp = int(
+            round(
+                self._train_spp_min
+                + (self._train_spp_max - self._train_spp_min) * (progress**2)
+            )
+        )
+        spp = max(self._train_spp_min, min(self._train_spp_max, spp))
+        return lr, spp
+
     def step(self) -> Optional[float]:
         """
         Runs one learning epoch. Returns the loss as a float, or None if finished.
@@ -485,6 +540,10 @@ class LearningSession:
         """
         if self._epoch >= self._max_epochs:
             return None
+
+        # Update LR/SPP schedule for this epoch.
+        self.learning_rate, self._current_spp = self._schedule_epoch()
+        self.renderer.max_iter = self._current_spp
 
         num_pixels = self.renderer.width * self.renderer.height
 
@@ -655,6 +714,8 @@ class LearningSession:
             delta[name] = best_np[name] - initial_np[name]
 
         logger.info("Min loss materials delta: %s", delta)
+        # Restore renderer SPP to the training maximum; caller may override for final renders.
+        self.renderer.max_iter = self._train_spp_max
         # Apply best decoded materials back onto the renderer's base material buffer,
         # then restore the renderer to use that buffer for non-learning rendering.
         wp.copy(self._base_materials, self.best_materials)

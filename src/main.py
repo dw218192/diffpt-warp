@@ -1158,16 +1158,28 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable debug mode.",
     )
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=0,
+        help="Base RNG seed offset.",
+    )
 
     diffrt_group = parser.add_argument_group("Differentiable Rendering")
     diffrt_group.add_argument(
         "--learning-rate", type=float, default=0.01, help="Learning rate."
     )
     diffrt_group.add_argument(
-        "--learning-iter",
+        "--lr-range",
+        type=str,
+        default="0.1:0.01",
+        help="Learning rate range start:end for scheduling (order not enforced; typically decays). Default: 0.1:0.01.",
+    )
+    diffrt_group.add_argument(
+        "--num-epochs",
         type=int,
         default=10,
-        help="Number of learning iterations.",
+        help="Number of learning epochs (each epoch = one render+replay step).",
     )
     diffrt_group.add_argument(
         "--target-image",
@@ -1176,17 +1188,12 @@ if __name__ == "__main__":
         help="Path to the target image. If not provided, learning will be disabled.",
     )
     diffrt_group.add_argument(
-        "--final-spp",
-        type=int,
-        default=100,
-        help="Number of samples per pixel for the final rendering.",
+        "--lr-spp-range",
+        type=str,
+        default="5:15",
+        help="Learning SPP range min:max. Default: 5:15.",
     )
-    diffrt_group.add_argument(
-        "--rng-seed",
-        type=int,
-        default=0,
-        help="Base RNG seed offset for differentiable rendering.",
-    )
+
     diffrt_group.add_argument(
         "--resample-interval",
         type=int,
@@ -1224,6 +1231,8 @@ if __name__ == "__main__":
         parser.error(
             f"--resample-interval must be >= 0 (0 disables reseeding); got {args.resample_interval}"
         )
+    if args.learning_rate <= 0:
+        parser.error(f"--learning-rate must be > 0; got {args.learning_rate}")
 
     if args.debug:
         wp.config.verify_autodiff = True
@@ -1239,6 +1248,41 @@ if __name__ == "__main__":
             unique_materials_per_mesh=(args.target_image is not None),
         )
 
+        # Helpers to parse ranges of form "min:max"
+        def _parse_range(spec: str, cast, name: str, check_order: bool = True):
+            parts = spec.split(":")
+            if len(parts) != 2:
+                parser.error(f"{name} must be in form a:b; got '{spec}'")
+            try:
+                lo = cast(parts[0])
+                hi = cast(parts[1])
+            except Exception:
+                parser.error(f"{name} values must be parseable; got '{spec}'")
+            if lo <= 0 or hi <= 0:
+                parser.error(f"{name} values must be > 0; got '{spec}'")
+            if check_order and hi < lo:
+                parser.error(f"{name} requires min<=max; got '{spec}'")
+            return lo, hi
+
+        # Learning LR range
+        if args.lr_range:
+            lr, lr_final = _parse_range(
+                args.lr_range, float, "--lr-range", check_order=False
+            )
+        else:
+            lr = args.learning_rate
+            lr_final = 0.1 * lr
+
+        # Learning SPP range
+        if args.lr_spp_range:
+            spp_min, spp_max = _parse_range(
+                args.lr_spp_range, int, "--lr-spp-range", check_order=True
+            )
+        else:
+            spp_min, spp_max = 1, args.spp
+        if spp_max < spp_min:
+            parser.error(f"--lr-spp-range requires min<=max; got {spp_min}:{spp_max}")
+
         if args.headless:
             logger.info("Running in headless mode (no UI).")
 
@@ -1249,23 +1293,28 @@ if __name__ == "__main__":
                 with LearningSession(
                     renderer,
                     target_image=target_image,
-                    learning_rate=args.learning_rate,
-                    max_epochs=args.learning_iter,
+                    learning_rate=lr,
+                    learning_rate_final=lr_final,
+                    max_epochs=args.num_epochs,
                     rng_seed=args.rng_seed,
                     resample_interval=args.resample_interval,
+                    min_spp=spp_min,
+                    max_spp=spp_max,
                 ) as session:
                     while True:
                         loss = session.step()
                         if loss is None:
                             break
                         logger.info(
-                            "Learning step %d/%d: loss=%.6f",
+                            "Learning step %d/%d: loss=%.6f lr=%.4g spp=%d",
                             session.epoch,
                             session.max_epochs,
                             session.loss_value,
+                            session.current_lr,
+                            session.current_spp,
                         )
-                # run a fresh render using the requested final spp
-                renderer.max_iter = args.final_spp
+                # run a fresh render using the requested spp
+                renderer.max_iter = args.spp
                 renderer.reset()
                 do_render_loop(renderer, save_path=args.save_path, save_raw=save_raw)
         else:
@@ -1407,10 +1456,13 @@ if __name__ == "__main__":
                 with LearningSession(
                     renderer,
                     target_image=target_image,
-                    learning_rate=args.learning_rate,
-                    max_epochs=args.learning_iter,
+                    learning_rate=lr,
+                    learning_rate_final=lr_final,
+                    max_epochs=args.num_epochs,
                     rng_seed=args.rng_seed,
                     resample_interval=args.resample_interval,
+                    min_spp=spp_min,
+                    max_spp=spp_max,
                 ) as session:
                     while g_running:
                         loss = session.step()
@@ -1427,13 +1479,16 @@ if __name__ == "__main__":
                         ax_total_loss.autoscale_view()
 
                         render_image_label.set_text(
-                            f"Epoch: {session.epoch}/{session.max_epochs} Loss: {session.loss_value:.4f}"
+                            f"Epoch: {session.epoch}/{session.max_epochs}  "
+                            f"Loss: {session.loss_value:.4f}  "
+                            f"LR: {session.current_lr:.4g}  "
+                            f"SPP: {session.current_spp}"
                         )
                         fig.canvas.draw()
                         fig.canvas.flush_events()
 
-                # run a fresh render using the requested final spp
-                renderer.max_iter = args.final_spp
+                # run a fresh render using the requested spp
+                renderer.max_iter = args.spp
                 renderer.reset()
                 do_render_loop(
                     renderer,
