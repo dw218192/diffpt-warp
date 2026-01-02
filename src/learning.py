@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
@@ -24,6 +25,14 @@ ADAM_EPS = 1e-8
 
 ALPHA_MIN = GGX_MIN_ALPHA
 ALPHA_MAX = 0.98  # avoid sigmoid saturation at 1.0
+
+# Roughness mapping:
+# We optimize u = log(alpha) where alpha = roughness^2 (GGX convention).
+# Then decode via roughness = sqrt(exp(u)).
+#
+# IMPORTANT: We do NOT clamp/squash in the forward path (that can zero/vanish grads near bounds).
+# Instead, we project u after each optimizer step:
+#   u <- clip(u, log(ALPHA_MIN), log(ALPHA_MAX))
 
 # Gradient clipping (global L2 norm) for stability under noisy/low-SPP gradients.
 GRAD_CLIP_NORM = 10.0
@@ -146,6 +155,31 @@ def sigmoid(x: float) -> float:
 
 
 @wp.func
+def softplus_beta(x: float, beta: float) -> float:
+    """
+    softplus_beta(x) = log(1 + exp(beta*x)) / beta
+    Implemented with simple saturation guards for numerical stability.
+    """
+    t = beta * x
+    # For large positive t, log(1+exp(t)) ~ t.
+    if t > 20.0:
+        return x
+    # For large negative t, log(1+exp(t)) ~ exp(t).
+    if t < -20.0:
+        return wp.exp(t) / beta
+    return wp.log(1.0 + wp.exp(t)) / beta
+
+
+@wp.func
+def softclip(z: float, lo: float, hi: float, beta: float) -> float:
+    """
+    Smooth "soft clip" to [lo, hi] with identity-like behavior in the interior:
+    derivative wrt z = sigmoid(beta*(z-lo)) - sigmoid(beta*(z-hi))
+    """
+    return lo + softplus_beta(z - lo, beta) - softplus_beta(z - hi, beta)
+
+
+@wp.func
 def logit01(p: float, eps: float) -> float:
     # Clamp to avoid +/-inf at the boundaries.
     p = wp.min(wp.max(p, eps), 1.0 - eps)
@@ -200,16 +234,17 @@ def encode_materials(
         inv_bounded_sigmoid01(m.base_color[2], _LATENT_EPS),
     )
 
-    # metallic: [0,1] -> logit
-    z.metallic = inv_bounded_sigmoid01(m.metallic, _LATENT_EPS)
+    # metallic: optimize in log space u=log(metallic), metallic=exp(u).
+    # This avoids a sigmoid/tanh squash Jacobian near 1; we keep it in-bounds via projection
+    # on u after the optimizer step.
+    z.metallic = wp.log(wp.clamp(m.metallic, _LATENT_EPS, 1.0 - _LATENT_EPS))
 
-    # roughness: [roughness_min, roughness_max] -> logit of normalized
-    # We optimize GGX alpha = roughness^2 (what the BSDF actually uses).
-    # Clamp to [ALPHA_MIN, ALPHA_MAX] to mirror BSDF clamping and avoid saturation.
-    alpha = wp.clamp(m.roughness * m.roughness, ALPHA_MIN, ALPHA_MAX)
-    inv_range = 1.0 / (ALPHA_MAX - ALPHA_MIN)
-    an = (alpha - ALPHA_MIN) * inv_range
-    z.roughness = logit01(an, _LATENT_EPS)
+    # roughness: u = log(alpha), alpha = roughness^2 (GGX)
+    r_lo = wp.sqrt(ALPHA_MIN)
+    r_hi = wp.sqrt(ALPHA_MAX)
+    r = wp.clamp(m.roughness, r_lo, r_hi)
+    alpha = r * r
+    z.roughness = wp.log(alpha)
 
     out_latent[i] = z
 
@@ -235,13 +270,14 @@ def decode_materials(
         bounded_sigmoid(latent_mats[i].base_color[2], _LATENT_EPS),
     )
 
-    # roughness via GGX alpha = roughness^2:
-    # alpha in [ALPHA_MIN, ALPHA_MAX], then roughness = sqrt(alpha).
-    alpha = ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * sigmoid(latent_mats[i].roughness)
-    m.roughness = wp.sqrt(alpha)
+    # Decode: roughness = sqrt(exp(u)) where u=log(alpha).
+    # No clamping here; keep the forward path free of saturation/clamp Jacobians.
+    u = latent_mats[i].roughness
+    m.roughness = wp.sqrt(wp.exp(u))
 
-    # metallic: [0,1]
-    m.metallic = bounded_sigmoid(latent_mats[i].metallic, _LATENT_EPS)
+    # metallic decode: metallic = exp(u), u=log(metallic)
+    # No clamping here; keep forward path free of saturation/clamp Jacobians.
+    m.metallic = wp.exp(latent_mats[i].metallic)
 
     out_mats[i] = m
 
@@ -278,16 +314,13 @@ def decode_latent_grads(
         g.base_color[2] * scale * sz * (1.0 - sz),
     )
 
-    # metallic: bounded_sigmoid(z, eps)
-    sm = sigmoid(z.metallic)
-    gz.metallic = g.metallic * scale * sm * (1.0 - sm)
+    # metallic: metallic = exp(u) => dmetallic/du = exp(u) = metallic
+    gz.metallic = g.metallic * wp.exp(z.metallic)
 
-    # roughness via alpha = ALPHA_MIN + range * sigmoid(z), roughness = sqrt(alpha)
-    # drough/dz = (0.5 / sqrt(alpha)) * range * sigmoid(z) * (1 - sigmoid(z))
-    sr = sigmoid(z.roughness)
-    a_range = ALPHA_MAX - ALPHA_MIN
-    alpha = ALPHA_MIN + a_range * sr
-    gz.roughness = g.roughness * (0.5 / wp.sqrt(alpha)) * a_range * sr * (1.0 - sr)
+    # roughness via u=log(alpha), r=sqrt(exp(u))=exp(0.5*u):
+    # dr/du = 0.5 * exp(0.5*u) = 0.5 * r
+    r = wp.exp(0.5 * z.roughness)
+    gz.roughness = g.roughness * (0.5 * r)
 
     out_latent_grads[i] = gz
 
@@ -340,6 +373,8 @@ def update_latent_materials_adam(
     m_hat_r = m.roughness * inv_bias1
     v_hat_r = v.roughness * inv_bias2
     z.roughness = z.roughness - lr * m_hat_r / (wp.sqrt(v_hat_r) + eps)
+    # Project u=log(alpha) to keep alpha in [ALPHA_MIN, ALPHA_MAX] without forward-path clamps.
+    z.roughness = wp.clamp(z.roughness, wp.log(ALPHA_MIN), wp.log(ALPHA_MAX))
 
     # --- metallic (scalar latent; unconstrained) ---
     m.metallic = beta1 * m.metallic + (1.0 - beta1) * g.metallic
@@ -347,6 +382,8 @@ def update_latent_materials_adam(
     m_hat_m = m.metallic * inv_bias1
     v_hat_m = v.metallic * inv_bias2
     z.metallic = z.metallic - lr * m_hat_m / (wp.sqrt(v_hat_m) + eps)
+    # Project metallic in log space: u=log(metallic) in [log(eps), log(1-eps)].
+    z.metallic = wp.clamp(z.metallic, wp.log(_LATENT_EPS), wp.log(1.0 - _LATENT_EPS))
 
     # Not optimized in latent mode; keep Adam buffers inert.
     m.emissive_color = wp.vec3(0.0)
@@ -504,11 +541,11 @@ class LearningSession:
 
     @property
     def current_lr(self) -> float:
-        return float(self.learning_rate)
+        return self.learning_rate
 
     @property
     def current_spp(self) -> int:
-        return int(self._current_spp)
+        return self._current_spp
 
     def _schedule_epoch(self) -> tuple[float, int]:
         """
@@ -547,6 +584,8 @@ class LearningSession:
 
         num_pixels = self.renderer.width * self.renderer.height
 
+        # Keep two copies of the decoded materials: one for the tape (for backward pass) and one for the primal rendering.
+        # This is to avoid corrupting the pre-computed material gradient during primal rendering.
         decoded_materials_tape = wp.zeros_like(
             self._base_materials, requires_grad=True
         )
@@ -563,29 +602,30 @@ class LearningSession:
         blurred_radiance_sum = wp.zeros_like(radiance_sum, requires_grad=True)
 
         tape = wp.Tape()
+
+        # For some reason, Warp does not propagate adjoints through this struct->struct decode
+        # so we implement JVP manually here.
+        def _decode_backward():
+            wp.launch(
+                kernel=decode_latent_grads,
+                dim=len(self.latent_materials),
+                inputs=[
+                    self.latent_materials,
+                    decoded_materials_tape.grad,
+                ],
+                outputs=[self.latent_materials.grad],
+            )
+
+        tape.record_func(
+            _decode_backward, [self.latent_materials, decoded_materials_tape]
+        )
+
         with tape:
             wp.launch(
                 kernel=decode_materials,
                 dim=len(self._base_materials),
                 inputs=[self.latent_materials, self._base_materials],
                 outputs=[decoded_materials_tape],
-            )
-
-            # For some reason, Warp does not propagate adjoints through this struct->struct decode
-            # so we implement JVP manually here.
-            def _decode_backward():
-                wp.launch(
-                    kernel=decode_latent_grads,
-                    dim=len(self.latent_materials),
-                    inputs=[
-                        self.latent_materials,
-                        decoded_materials_tape.grad,
-                    ],
-                    outputs=[self.latent_materials.grad],
-                )
-
-            tape.record_func(
-                _decode_backward, [self.latent_materials, decoded_materials_tape]
             )
 
         # For primal (path-recording) rendering, just copy tape decode to a render buffer.
@@ -684,6 +724,39 @@ class LearningSession:
         self.renderer.materials = prev_renderer_materials
 
         self._epoch += 1
+
+        # ---- DEBUG: gradient inspection ----
+        # idx = 15  # sphere material index
+
+        # dec_g = decoded_materials_tape.grad.numpy()  # dL/d(decoded)
+        # lat_g = self.latent_materials.grad.numpy()  # dL/d(latent)
+        # lat_z = self.latent_materials.numpy()  # latent values
+
+        # # decoded-space grads
+        # g_dec_r = float(dec_g["roughness"][idx])
+        # g_dec_m = float(dec_g["metallic"][idx])
+        # g_dec_c = dec_g["base_color"][idx].astype(np.float64)
+
+        # # latent-space grads
+        # g_lat_r = float(lat_g["roughness"][idx])
+        # z_r = float(lat_z["roughness"][idx])
+
+        # # mapping diagnostics for roughness VJP
+        # sr = 1.0 / (1.0 + np.exp(-z_r))
+        # a_range = float(ALPHA_MAX - ALPHA_MIN)
+        # alpha = float(ALPHA_MIN + a_range * sr)
+        # sig_slope = float(sr * (1.0 - sr))
+        # jac = float((0.5 / np.sqrt(alpha)) * a_range * sig_slope)  # d(rough)/d(z)
+
+        # print(
+        #     f"[dbg idx={idx}] z_r={z_r:.3f} sr={sr:.6f} slope={sig_slope:.3e} "
+        #     f"alpha={alpha:.4f} jac(drough/dz)={jac:.3e}\n"
+        #     f"  decoded grads:  dL/drough={g_dec_r:.3e} dL/dmetal={g_dec_m:.3e} "
+        #     f"dL/dcolor=[{g_dec_c[0]:.3e},{g_dec_c[1]:.3e},{g_dec_c[2]:.3e}]\n"
+        #     f"  latent grad:    dL/dz_rough={g_lat_r:.3e} (expected ~ {g_dec_r*jac:.3e})"
+        # )
+        # -------------------------------
+
         return self.loss_value
 
     @property
