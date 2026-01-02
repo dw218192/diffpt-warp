@@ -437,8 +437,8 @@ class LearningSession:
         renderer: Renderer,
         *,
         target_image: np.ndarray,
-        learning_rate: float,
-        learning_rate_final: Optional[float] = None,
+        min_lr: float,
+        max_lr: Optional[float] = None,
         max_epochs: int,
         rng_seed: int = 0,
         resample_interval: int = 0,
@@ -446,19 +446,15 @@ class LearningSession:
         max_spp: Optional[int] = None,
     ):
         self.renderer = renderer
-        self._lr_start = learning_rate
-        if self._lr_start <= 0.0:
-            raise ValueError(f"learning_rate must be > 0; got {self._lr_start}")
-        lr_final = learning_rate_final
-        if lr_final is None:
-            lr_final = 0.1 * self._lr_start
-        if lr_final <= 0.0:
-            raise ValueError(
-                f"learning_rate_final must be > 0; got {lr_final} (before clamping)"
-            )
-        # Allow either direction (most cases decrease); scheduler interpolates between endpoints.
-        self._lr_final = lr_final
-        self.learning_rate = self._lr_start  # mutable, updated by scheduler
+
+        if max_lr is None:
+            max_lr = 5 * min_lr
+        elif max_lr < min_lr:
+            raise ValueError(f"max_lr must be >= min_lr; got {max_lr} < {min_lr}")
+
+        self._lr_min = min_lr
+        self._lr_max = max_lr
+        self._lr = self._lr_max  # mutable, updated by scheduler
 
         # Samples-per-pixel schedule bounds.
         spp_cap = max_spp if max_spp is not None else renderer.max_iter
@@ -466,7 +462,7 @@ class LearningSession:
             raise ValueError(f"max_spp must be > 0; got {spp_cap}")
         self._train_spp_max = spp_cap
         self._train_spp_min = max(1, min(min_spp, self._train_spp_max))
-        self._current_spp = self._train_spp_min
+        self._current_train_spp = self._train_spp_min  # mutable, updated by scheduler
 
         self._max_epochs = max_epochs
         self._epoch = 0
@@ -541,11 +537,11 @@ class LearningSession:
 
     @property
     def current_lr(self) -> float:
-        return self.learning_rate
+        return self._lr
 
     @property
     def current_spp(self) -> int:
-        return self._current_spp
+        return self._current_train_spp
 
     def _schedule_epoch(self) -> tuple[float, int]:
         """
@@ -558,7 +554,7 @@ class LearningSession:
         progress = min(1.0, self._epoch / denom)
 
         # Ease-out LR decay (quadratic) for stability near the end.
-        lr = self._lr_final + (self._lr_start - self._lr_final) * (1.0 - progress) ** 2
+        lr = self._lr_min + (self._lr_max - self._lr_min) * (1.0 - progress) ** 2
 
         # Ease-in SPP ramp (quadratic) to spend more effort later.
         spp = int(
@@ -579,8 +575,8 @@ class LearningSession:
             return None
 
         # Update LR/SPP schedule for this epoch.
-        self.learning_rate, self._current_spp = self._schedule_epoch()
-        self.renderer.max_iter = self._current_spp
+        self._lr, self._current_train_spp = self._schedule_epoch()
+        self.renderer.max_iter = self._current_train_spp
 
         num_pixels = self.renderer.width * self.renderer.height
 
@@ -712,7 +708,7 @@ class LearningSession:
             kernel=update_latent_materials_adam,
             dim=len(self.latent_materials),
             inputs=[
-                self.learning_rate,
+                self._lr,
                 float(self._epoch + 1),
                 self.latent_materials.grad,
                 self.latent_materials,
@@ -724,39 +720,6 @@ class LearningSession:
         self.renderer.materials = prev_renderer_materials
 
         self._epoch += 1
-
-        # ---- DEBUG: gradient inspection ----
-        # idx = 15  # sphere material index
-
-        # dec_g = decoded_materials_tape.grad.numpy()  # dL/d(decoded)
-        # lat_g = self.latent_materials.grad.numpy()  # dL/d(latent)
-        # lat_z = self.latent_materials.numpy()  # latent values
-
-        # # decoded-space grads
-        # g_dec_r = float(dec_g["roughness"][idx])
-        # g_dec_m = float(dec_g["metallic"][idx])
-        # g_dec_c = dec_g["base_color"][idx].astype(np.float64)
-
-        # # latent-space grads
-        # g_lat_r = float(lat_g["roughness"][idx])
-        # z_r = float(lat_z["roughness"][idx])
-
-        # # mapping diagnostics for roughness VJP
-        # sr = 1.0 / (1.0 + np.exp(-z_r))
-        # a_range = float(ALPHA_MAX - ALPHA_MIN)
-        # alpha = float(ALPHA_MIN + a_range * sr)
-        # sig_slope = float(sr * (1.0 - sr))
-        # jac = float((0.5 / np.sqrt(alpha)) * a_range * sig_slope)  # d(rough)/d(z)
-
-        # print(
-        #     f"[dbg idx={idx}] z_r={z_r:.3f} sr={sr:.6f} slope={sig_slope:.3e} "
-        #     f"alpha={alpha:.4f} jac(drough/dz)={jac:.3e}\n"
-        #     f"  decoded grads:  dL/drough={g_dec_r:.3e} dL/dmetal={g_dec_m:.3e} "
-        #     f"dL/dcolor=[{g_dec_c[0]:.3e},{g_dec_c[1]:.3e},{g_dec_c[2]:.3e}]\n"
-        #     f"  latent grad:    dL/dz_rough={g_lat_r:.3e} (expected ~ {g_dec_r*jac:.3e})"
-        # )
-        # -------------------------------
-
         return self.loss_value
 
     @property

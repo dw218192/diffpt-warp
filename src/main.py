@@ -1354,12 +1354,14 @@ if __name__ == "__main__":
 
         # Learning LR range
         if args.lr_range:
-            lr, lr_final = _parse_range(
+            lr_a, lr_b = _parse_range(
                 args.lr_range, float, "--lr-range", check_order=False
             )
+            max_lr = max(lr_a, lr_b)
+            min_lr = min(lr_a, lr_b)
         else:
-            lr = args.learning_rate
-            lr_final = 0.1 * lr
+            max_lr = args.learning_rate
+            min_lr = 0.1 * max_lr
 
         # Learning SPP range
         if args.lr_spp_range:
@@ -1381,8 +1383,8 @@ if __name__ == "__main__":
                 with LearningSession(
                     renderer,
                     target_image=target_image,
-                    learning_rate=lr,
-                    learning_rate_final=lr_final,
+                    min_lr=min_lr,
+                    max_lr=max_lr,
                     max_epochs=args.num_epochs,
                     rng_seed=args.rng_seed,
                     resample_interval=args.resample_interval,
@@ -1573,8 +1575,8 @@ if __name__ == "__main__":
                     with LearningSession(
                         renderer,
                         target_image=target_image,
-                        learning_rate=lr,
-                        learning_rate_final=lr_final,
+                        min_lr=min_lr,
+                        max_lr=max_lr,
                         max_epochs=args.num_epochs,
                         rng_seed=args.rng_seed,
                         resample_interval=args.resample_interval,
