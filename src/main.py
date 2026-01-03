@@ -77,7 +77,11 @@ class PathSegment:
 class ReplayPathData:
     pixel_idx: int  # associated pixel index
     path_len: int  # length of the path, 0 if invalid
-    terminal_contrib: wp.vec3  # contribution at terminal light-hit
+    # terminal mesh-light hit (optional; valid when path_len > 0 and the path hit a mesh light)
+    terminal_Le: wp.vec3  # light emission at hit light (rgb)
+    terminal_light_pdf_solid_angle: (
+        float  # solid-angle pdf of sampling the hit point on that light
+    )
 
 
 # per-depth/bounce
@@ -87,22 +91,16 @@ class ReplayBounceData:
     hit_mat_id: wp.uint64
     wo: wp.vec3
 
-    # BSDF-sampled continuation
-    wi_bsdf: wp.vec3
-    pdf_bsdf: float
+    rand_state_bsdf: wp.uint32
 
     # NEE (optional per bounce)
     nee_valid: int
     wi_nee_local: wp.vec3
     light_pdf_solid_angle: float
-    mis_w_nee: float
     Le_nee: wp.vec3  # light emission at sampled light (rgb)
 
     # emissive add at surface after throughput update (optional)
     add_emissive: int  # 1 if is_emissive(mat) was applied in forward
-
-    # russian roulette
-    inv_p_rr: float  # 1.0 / p_rr
 
 
 @wp.struct
@@ -378,7 +376,8 @@ def shade(
             # finalize replay data for terminal light hit
             if record_path_replay_data:
                 path_data = replay_path_data[tid]
-                path_data.terminal_contrib = contrib
+                path_data.terminal_Le = mesh.light_color * mesh.light_intensity
+                path_data.terminal_light_pdf_solid_angle = light_pdf_solid_angle
                 path_data.pixel_idx = path.pixel_idx
                 path_data.path_len = path.depth + 1
                 replay_path_data[tid] = path_data
@@ -438,11 +437,11 @@ def shade(
                     bounce_data.nee_valid = 1
                     bounce_data.wi_nee_local = wi
                     bounce_data.light_pdf_solid_angle = light_pdf_solid_angle
-                    bounce_data.mis_w_nee = mis_weight
                     bounce_data.Le_nee = Le
                     replay_bounce_data[replay_bounce_data_idx] = bounce_data
 
         # BSDF sampling
+        rand_state_bsdf = rand_state
         wi = mat_sample(mat, rand_state, wo)
         pdf = mat_pdf(mat, wi, wo)
         if pdf <= 0.0 or wi.z < 0.0:
@@ -466,8 +465,7 @@ def shade(
             bounce_data = replay_bounce_data[replay_bounce_data_idx]
             bounce_data.hit_mat_id = mesh.material_id
             bounce_data.wo = wo
-            bounce_data.wi_bsdf = wi
-            bounce_data.pdf_bsdf = pdf
+            bounce_data.rand_state_bsdf = rand_state_bsdf
             replay_bounce_data[replay_bounce_data_idx] = bounce_data
 
         path.point = hit_point + hit_normal * EPSILON
@@ -485,38 +483,25 @@ def shade(
                 bounce_data.add_emissive = 1
                 replay_bounce_data[replay_bounce_data_idx] = bounce_data
 
-        # russain roulette
-        # the brighter the path, the higher the chance of its survival
-        p_rr = wp.clamp(
-            wp.max(throughput.x, wp.max(throughput.y, throughput.z)), 0.22, 1.0
-        )
+        if not record_path_replay_data:
+            # russain roulette
+            # the brighter the path, the higher the chance of its survival
+            p_rr = wp.clamp(
+                wp.max(throughput.x, wp.max(throughput.y, throughput.z)), 0.22, 1.0
+            )
 
-        if wp.randf(rand_state) > p_rr:
-            radiance = wp.vec3(0.0)
-            path.radiance = radiance
-            path.throughput = throughput
-            path.depth = -1
-            wp.atomic_add(num_finished_paths, 0, 1)
+            if wp.randf(rand_state) > p_rr:
+                radiance = wp.vec3(0.0)
+                path.radiance = radiance
+                path.throughput = throughput
+                path.depth = -1
+                wp.atomic_add(num_finished_paths, 0, 1)
+                path_segments[tid] = path
+                return
 
-            # invalidate replay data
-            if record_path_replay_data:
-                path_data = replay_path_data[tid]
-                path_data.pixel_idx = path.pixel_idx
-                path_data.path_len = 0
-                replay_path_data[tid] = path_data
+            inv_p_rr = 1.0 / p_rr
 
-            path_segments[tid] = path
-            return
-
-        inv_p_rr = 1.0 / p_rr
-
-        # record russian roulette for replay
-        if record_path_replay_data:
-            bounce_data = replay_bounce_data[replay_bounce_data_idx]
-            bounce_data.inv_p_rr = inv_p_rr
-            replay_bounce_data[replay_bounce_data_idx] = bounce_data
-
-        throughput = throughput * inv_p_rr
+            throughput = throughput * inv_p_rr
 
         # hard stop
         if path.depth == max_depth - 1:
@@ -566,6 +551,7 @@ def replay_path(
     tid = wp.tid()
     radiance = wp.vec3(0.0)
     throughput = wp.vec3(1.0)
+    prev_bsdf_pdf = float(0.0)
 
     path_data = replay_path_data[tid]
     pixel_idx = path_data.pixel_idx
@@ -582,16 +568,18 @@ def replay_path(
         # --- NEE term at this bounce (if recorded) ---
         if rec.nee_valid != 0:
             wiL = rec.wi_nee_local
-            # replay same estimator form as shade():
-            # contrib = throughput * (bsdf * cos / light_pdf_solid_angle) * Le * mis_w
+            # replay same estimator form as shade(), but recompute MIS weight (depends on material via mat_pdf)
+            bsdf_pdf = mat_pdf(mat, wiL, wo)
+            mis_w_nee = power_heuristic(rec.light_pdf_solid_angle, bsdf_pdf)
             fL = mat_eval_bsdf(mat, wiL, wo)
             cL = wp.cw_mul(throughput, fL * wiL.z / rec.light_pdf_solid_angle)
             cL = wp.cw_mul(cL, rec.Le_nee)
-            radiance += rec.mis_w_nee * cL
+            radiance += mis_w_nee * cL
 
         # --- BSDF continuation throughput update ---
-        wi = rec.wi_bsdf
-        pdf = rec.pdf_bsdf
+        bsdf_state = rec.rand_state_bsdf
+        wi = mat_sample(mat, bsdf_state, wo)
+        pdf = mat_pdf(mat, wi, wo)
 
         if pdf <= 0.0 or wi.z <= 0.0:
             out_radiance[pixel_idx] = wp.vec3(0.0)
@@ -599,16 +587,21 @@ def replay_path(
 
         f = mat_eval_bsdf(mat, wi, wo)
         throughput = wp.cw_mul(throughput, f * wi.z / pdf)
+        prev_bsdf_pdf = pdf
 
         if rec.add_emissive != 0:
             radiance += wp.cw_mul(
                 throughput, mat.emissive_color * mat.emissive_intensity
             )
 
-        throughput = throughput * rec.inv_p_rr
-
     # --- Terminal mesh-light hit contribution ---
-    radiance += path_data.terminal_contrib
+    if path_data.path_len > 1:
+        mis_w_term = power_heuristic(
+            prev_bsdf_pdf, path_data.terminal_light_pdf_solid_angle
+        )
+    else:
+        mis_w_term = 1.0
+    radiance += mis_w_term * wp.cw_mul(throughput, path_data.terminal_Le)
     out_radiance[path_data.pixel_idx] = radiance
 
 
