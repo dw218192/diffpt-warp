@@ -96,6 +96,20 @@ def Scope "Materials" (
         }
     }
 
+    def Material "diffuse_yellow"
+    {
+        token outputs:surface.connect = </Materials/diffuse_yellow/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor = (1.0, 1.0, 0.0)
+            float inputs:metallic = 0.0
+            float inputs:roughness = 1.0
+            token outputs:surface
+        }
+    }
+
     def Material "metal_grey"
     {
         token outputs:surface.connect = </Materials/metal_grey/PreviewSurface.outputs:surface>

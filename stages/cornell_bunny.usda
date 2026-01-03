@@ -1,0 +1,233 @@
+#usda 1.0
+(
+    customLayerData = {
+        dictionary cameraSettings = {
+            dictionary Front = {
+                double3 position = (0, 0, 500)
+                double radius = 500
+            }
+            dictionary Perspective = {
+                double3 position = (2.916469854506549, 6.8682262905964055, 10.2737959108447)
+                double3 target = (0.08041908453598712, 4.728320342402199, 0.6475176814394068)
+            }
+            dictionary Right = {
+                double3 position = (-500, 0, 0)
+                double radius = 500
+            }
+            dictionary Top = {
+                double3 position = (0, 500, 0)
+                double radius = 500
+            }
+            string boundCamera = "/OmniverseKit_Persp"
+        }
+        dictionary metricsAssembler = {
+            int version = 1
+        }
+        dictionary renderSettings = {
+            double "rtx:post:chromaticAberration:strengthB" = -0.054999999701976776
+            double "rtx:post:chromaticAberration:strengthG" = -0.054999999701976776
+        }
+    }
+    defaultPrim = "geo"
+    framesPerSecond = 24
+    metersPerUnit = 1
+    subLayers = [
+        @../assets/materials.usda@
+    ]
+    timeCodesPerSecond = 24
+    upAxis = "Y"
+)
+
+def Xform "geo" (
+    kind = "group"
+)
+{
+    def Xform "left" (
+        kind = "component"
+    )
+    {
+        double3 xformOp:rotateXYZ = (0, 90, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (-5, 5, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+
+        def "quad" (
+            prepend payload = @../assets/quad.usda@
+        )
+        {
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/diffuse_white>
+            }
+        }
+    }
+
+    def Xform "right" (
+        kind = "component"
+    )
+    {
+        double3 xformOp:rotateXYZ = (0, -90, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (5, 5, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+
+        def "quad" (
+            prepend payload = @../assets/quad.usda@
+        )
+        {
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/diffuse_white>
+            }
+        }
+    }
+
+    def Xform "floor" (
+        kind = "component"
+    )
+    {
+        double3 xformOp:rotateXYZ = (-90, 0, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+
+        def "quad" (
+            prepend payload = @../assets/quad.usda@
+        )
+        {
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/diffuse_white>
+            }
+        }
+    }
+
+    def Xform "top" (
+        kind = "component"
+    )
+    {
+        double3 xformOp:rotateXYZ = (90, 0, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (0, 10, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+
+        def "quad" (
+            prepend payload = @../assets/quad.usda@
+        )
+        {
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/diffuse_white>
+            }
+        }
+    }
+
+    def Xform "back" (
+        kind = "component"
+    )
+    {
+        double3 xformOp:rotateXYZ = (0, 0, 0)
+        double3 xformOp:scale = (5, 5, 1)
+        double3 xformOp:translate = (0, 5, -5)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+
+        def "quad" (
+            prepend payload = @../assets/quad.usda@
+        )
+        {
+            over "Quad" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/diffuse_yellow>
+            }
+        }
+    }
+
+    def Xform "sphere" (
+        kind = "component"
+    )
+    {
+        quatf xformOp:orient = (0.9659259, -3.4736967e-9, 0.25881886, -2.6033586e-9)
+        float3 xformOp:scale = (50, 50, 50)
+        double3 xformOp:scale:unitsResolve = (0.01, 0.01, 0.01)
+        double3 xformOp:translate = (-1.368949478556321, 4.53046647808163, -0.32882985266485365)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:scale:unitsResolve"]
+
+        def "sphere" (
+            prepend payload = @../assets/sphere.usda@
+        )
+        {
+            over "Sphere" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/diffuse_green>
+            }
+        }
+    }
+
+    def "bunny" (
+        prepend payload = @../assets/bunny.usda@
+    )
+    {
+        quatf xformOp:orient = (0.68301266, -0.6830127, 0.1830127, 0.18301271)
+        double xformOp:rotateX:unitsResolve = 90
+        float3 xformOp:scale = (34, 34, 34)
+        double3 xformOp:translate = (0.6549513259256455, -1.1813750246291992, -1.8305929464132487)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale", "xformOp:rotateX:unitsResolve"]
+
+        over "bunny"
+        {
+            over "mesh" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                rel material:binding = </Materials/plastic_grey>
+            }
+        }
+    }
+}
+
+def Xform "lights"
+{
+    def RectLight "arealight1"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:height = 3
+        float inputs:intensity = 10
+        float inputs:width = 3
+        matrix4d xformOp:transform = ( (-8.881784197001251e-16, 1.9999999999999996, 3.330669073875469e-16, 0), (1.998401444325281e-15, 0, 1.9999999999999987, 0), (0.9999999999999996, 6.10622663543836e-16, -8.88178419700125e-16, 0), (-4.915538992615069, 5.962915550050287, -2.1315730401291273e-28, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+}
+
+def Xform "cameras"
+{
+    def Camera "camera1"
+    {
+        float2 clippingRange = (1, 1000000)
+        float exposure = 0
+        float focalLength = 0.2
+        float focusDistance = 5
+        float fStop = 0
+        float horizontalAperture = 0.20955
+        float horizontalApertureOffset = 0
+        token projection = "perspective"
+        double shutter:close = 0.25
+        double shutter:open = -0.25
+        float verticalAperture = 0.11787187
+        float verticalApertureOffset = 0
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 5, 22, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+}
+
