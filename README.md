@@ -4,11 +4,23 @@ This is a hello-world project for learning the basics of differentiable renderin
 
 ## Demos
 
+### Simple Sphere Stage
+
 https://github.com/user-attachments/assets/1a08466d-fe19-4125-b05e-05b85c06741b
 
 ```bash
 uv run ./src/main.py --num-epochs 300 --lr-range 0.03:0.3 --lr-spp-range 5:15 --target-image ./_output/target/cornell_sphere_test_target.hdr --usd-path ./stages/cornell_sphere_test.usda --save-path ./_output/learned --spp 100 --resample-interval 10
 ```
+
+### Bunny Stage
+An example of a noise floor preventing roughness and metalness to be learned better; to alleviate this issue, a better learning process (loss function & lr/spp scheduling) is likely needed.
+
+https://github.com/user-attachments/assets/0c897ff2-2472-42a7-b1aa-7e8cbc028829
+
+```bash
+uv run .\src\main.py --num-epochs 500 --lr-range 0.1:0.1 --lr-spp-range 15:15 --target-image .\_output\target\cornell_bunny_target.hdr --usd-path .\stages\cornell_bunny.usda --save-path .\_output\learned --spp 100 --resample-interval 0
+```
+
 
 ## Setup and running the project
 
@@ -93,3 +105,4 @@ With `--stochastic`, the script will also call `mat_sample` to generate stochast
 
 
 ![BRDF Lobe](./readme_assets/brdf_viewer.png)
+
