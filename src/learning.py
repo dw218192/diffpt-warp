@@ -663,19 +663,62 @@ class LearningSession:
         best_np = self.best_materials.numpy()
         initial_np = self.initial_materials.numpy()
 
-        def _fmt_val(v):
-            return np.asarray(v).tolist()
+        def _fmt_val(v, decimals=4):
+            """Format a value (scalar or array) to specified decimal places."""
+            arr = np.asarray(v)
+            if arr.ndim == 0:
+                return f"{arr.item():.{decimals}f}"
+            else:
+                formatted = [f"{x:.{decimals}f}" for x in arr.flatten()]
+                if len(formatted) == 1:
+                    return formatted[0]
+                return "[" + ", ".join(formatted) + "]"
 
+        def _compute_overall_change(before_dict, after_dict):
+            """Compute L2 norm of all field deltas as a measure of overall change."""
+            all_deltas = []
+            for field in before_dict.keys():
+                delta = np.asarray(after_dict[field]) - np.asarray(before_dict[field])
+                all_deltas.extend(delta.flatten())
+            return float(np.linalg.norm(all_deltas))
+
+        max_material_change = 0.0
+        max_material_change_mesh_name = ""
         lines = ["Materials summary (before -> after | delta):"]
         for mat_id in range(len(best_np)):
             mesh_name = self.renderer.get_mesh_name_from_material_id(mat_id)
             lines.append(f"  [{mat_id}] mesh='{mesh_name}'")
+
+            # Collect all field changes for overall metric
+            before_dict = {}
+            after_dict = {}
+
             for field in best_np.dtype.names:
-                before = _fmt_val(initial_np[field][mat_id])
-                after = _fmt_val(best_np[field][mat_id])
-                delta = _fmt_val(best_np[field][mat_id] - initial_np[field][mat_id])
-                lines.append(f"    {field}: {before} -> {after} | Δ={delta}")
+                before_val = initial_np[field][mat_id]
+                after_val = best_np[field][mat_id]
+                delta_val = after_val - before_val
+
+                before_dict[field] = before_val
+                after_dict[field] = after_val
+
+                before_str = _fmt_val(before_val)
+                after_str = _fmt_val(after_val)
+                delta_str = _fmt_val(delta_val)
+                lines.append(
+                    f"    {field}: {before_str} -> {after_str} | Δ={delta_str}"
+                )
+
+            # Compute and display overall change metric
+            overall_change = _compute_overall_change(before_dict, after_dict)
+            lines.append(f"    [overall change L2 norm: {overall_change:.6f}]")
+            if overall_change > max_material_change:
+                max_material_change = overall_change
+                max_material_change_mesh_name = mesh_name
+
         logger.info("\n".join(lines))
+        logger.info(
+            f"Max material change: {max_material_change:.6f} (mesh '{max_material_change_mesh_name}')"
+        )
 
         # Restore renderer SPP to the training maximum; caller may override for final renders.
         self.renderer.max_iter = self._train_spp_max
