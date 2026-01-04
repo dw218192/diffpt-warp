@@ -86,69 +86,6 @@ def _compute_loss_kernel(
     wp.atomic_add(loss, 0, l)
 
 
-@wp.kernel
-def _gaussian_blur3x3(
-    width: int,
-    height: int,
-    # Read
-    src: wp.array(dtype=wp.vec3),
-    # Write
-    dst: wp.array(dtype=wp.vec3),
-):
-    """
-    Lightweight 3x3 Gaussian blur with weights [[1,2,1],[2,4,2],[1,2,1]] / 16.
-    """
-    tid = wp.tid()
-    x = tid % width
-    y = tid // width
-
-    acc = wp.vec3(0.0)
-    w_sum = 0.0
-
-    # y - 1
-    if y > 0 and x > 0:
-        w = 1.0
-        acc += src[(y - 1) * width + (x - 1)] * w
-        w_sum += w
-    if y > 0:
-        w = 2.0
-        acc += src[(y - 1) * width + x] * w
-        w_sum += w
-    if y > 0 and x + 1 < width:
-        w = 1.0
-        acc += src[(y - 1) * width + (x + 1)] * w
-        w_sum += w
-
-    # y
-    if x > 0:
-        w = 2.0
-        acc += src[y * width + (x - 1)] * w
-        w_sum += w
-    w = 4.0
-    acc += src[tid] * w
-    w_sum += w
-    if x + 1 < width:
-        w = 2.0
-        acc += src[y * width + (x + 1)] * w
-        w_sum += w
-
-    # y + 1
-    if y + 1 < height and x > 0:
-        w = 1.0
-        acc += src[(y + 1) * width + (x - 1)] * w
-        w_sum += w
-    if y + 1 < height:
-        w = 2.0
-        acc += src[(y + 1) * width + x] * w
-        w_sum += w
-    if y + 1 < height and x + 1 < width:
-        w = 1.0
-        acc += src[(y + 1) * width + (x + 1)] * w
-        w_sum += w
-
-    dst[tid] = acc / w_sum
-
-
 @wp.func
 def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + wp.exp(-x))
@@ -495,17 +432,6 @@ class LearningSession:
             target_image.reshape((-1, 3)),
             dtype=wp.vec3,
         )
-        self._blurred_target = wp.zeros_like(self.target_image)
-        wp.launch(
-            kernel=_gaussian_blur3x3,
-            dim=renderer.width * renderer.height,
-            inputs=[
-                renderer.width,
-                renderer.height,
-                self.target_image,
-            ],
-            outputs=[self._blurred_target],
-        )
 
         self.min_loss = float("inf")
         self.best_materials = wp.zeros_like(self._base_materials)
@@ -595,7 +521,6 @@ class LearningSession:
         self.latent_materials.grad.zero_()
 
         radiance_sum = wp.zeros(num_pixels, dtype=wp.vec3, requires_grad=True)
-        blurred_radiance_sum = wp.zeros_like(radiance_sum, requires_grad=True)
 
         tape = wp.Tape()
 
@@ -662,21 +587,11 @@ class LearningSession:
                 )
 
         with tape:
-            wp.launch(
-                kernel=_gaussian_blur3x3,
-                dim=num_pixels,
-                inputs=[
-                    self.renderer.width,
-                    self.renderer.height,
-                    radiance_sum,
-                ],
-                outputs=[blurred_radiance_sum],
-            )
             compute_loss(
                 self.renderer.max_iter,
                 num_pixels,
-                blurred_radiance_sum,
-                self._blurred_target,
+                radiance_sum,
+                self.target_image,
                 HUBER_DELTA,
                 self.per_pixel_loss,
                 self.loss,
