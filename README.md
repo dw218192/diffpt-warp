@@ -1,4 +1,4 @@
-# Differentiable Path Tracing via path replay backprop for material optimization (Warp + OpenUSD)
+# Differentiable Path Tracing via path replay for material optimization (Warp + OpenUSD)
 
 This is a hello-world project for learning the basics of differentiable rendering and differentiable programming in general.
 
@@ -40,15 +40,14 @@ By default, the render output will be saved as raw HDR to `./_output/target/corn
 
 To save an 8-bit tonemapped PNG instead, add `--save-png`.
 
-## Learning the Materials via Differentiable Rendering
-
-The derivative of the light transport integral is computed using the path replay technique described in [Path Replay Backpropagation](https://dvicini.github.io/path-replay-backpropagation/)
+## Learning the Materials by differentiating the light transport integral
 
 Some Simplifications:
 1. The target image is usually self-rendered from exactly the same camera settings with exactly the same visible geometries as the learning stage. This makes everything smooth and avoids discontinuities introduced by visibility changes.
 2. The target image is expected to be in linear color space (i.e. raw HDR).
 3. Only base color, roughness, and metallic are optimized.
-4. Instead of doing a space-efficient adjoint path transport with only BSDF auto-differentiated, I brute-force cache as many primal rendering states as needed and auto-diff the kernal that replays the cached path. This is just a quick and dirty solution to get the job done.
+4. Instead of doing a space-efficient adjoint path transport with only BSDF auto-differentiated (as described in [Path Replay Backpropagation](https://dvicini.github.io/path-replay-backpropagation/)), I brute-force cache as many primal rendering states as needed and auto-diff the kernal that replays the cached path. This is just a quick and dirty solution to get the job done.
+    - ideally, only loop states (accumulated radiance, throughput, random state) are needed to replay the paths and compute the gradient, instead of the huge replay buffers.
 
 ```bash
 uv run ./src/main.py --num-epochs 300 --lr-range 0.03:0.3 --lr-spp-range 5:15 --target-image ./_output/target/cornell_sphere_test_target.hdr --usd-path ./stages/cornell_sphere_test.usda --save-path ./_output/learned --spp 100 --resample-interval 10
