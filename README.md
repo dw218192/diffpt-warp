@@ -29,7 +29,7 @@ uv run ./src/main.py -h
 
 This project implements a simple wavefront-style path tracer with the following features:
 1. Multiple importance sampling using direct light sampling (next event estimation)
-2. Metallic-roughness material using a Trowbridge–Reitz NDF with Smith $G$, and Fresnel via Schlick
+2. Metallic-roughness material workflow using a Trowbridge–Reitz NDF with Smith $G$, and Fresnel via Schlick
 
 To render a simple stage with 1000 samples per pixel:
 

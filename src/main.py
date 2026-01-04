@@ -28,10 +28,8 @@ from matplotlib.animation import FFMpegWriter
 from usd_utils import extract_pos
 from warp_math_utils import (
     get_coord_system,
-    triangle_sample,
     power_heuristic,
     area_to_solid_angle,
-    get_triangle_points,
     hash3,
 )
 
@@ -49,7 +47,16 @@ from material import (
     mat_pdf,
 )
 from learning import LearningSession
-from render_utils import tonemap, save_image, load_target_image
+from render_utils import (
+    tonemap_kernel,
+    save_image,
+    load_target_image,
+    HitData,
+    scene_intersect,
+    light_sample,
+    compute_light_pdf,
+    is_visible,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -90,7 +97,6 @@ class ReplayPathData:
 class ReplayBounceData:
     hit_mat_id: wp.uint64
     wo: wp.vec3
-
     rand_state_bsdf: wp.uint32
 
     # NEE (optional per bounce)
@@ -98,146 +104,6 @@ class ReplayBounceData:
     wi_nee_local: wp.vec3
     light_pdf_solid_angle: float
     Le_nee: wp.vec3  # light emission at sampled light (rgb)
-
-    # emissive add at surface after throughput update (optional)
-    add_emissive: int  # 1 if is_emissive(mat) was applied in forward
-
-
-@wp.struct
-class HitData:
-    mesh_idx: int  # -1 if miss
-    face_idx: int
-    hit_point: wp.vec3
-    hit_normal: wp.vec3
-
-
-@wp.func
-def scene_intersect(
-    bvh_id: wp.uint64,
-    ro: wp.vec3,
-    rd: wp.vec3,
-    meshes: wp.array(dtype=Mesh),
-    max_t: float,
-    back_face: bool,
-) -> HitData:
-    """
-    Find the closest intersection between a ray and the scene geometries (including lights).
-    Returns the hit data.
-    """
-    t = wp.float32(max_t)
-    hit_mesh_idx = wp.int32(-1)
-    hit_normal = wp.vec3(0.0)
-    hit_point = wp.vec3(0.0)
-    hit_face_idx = wp.int32(-1)
-
-    if bvh_id == wp.uint64(-1):
-        for i in range(meshes.shape[0]):
-            mesh_query = wp.mesh_query_ray(meshes[i].mesh_id, ro, rd, t)
-            if mesh_query.result and mesh_query.t < t and mesh_query.t > 0.0:
-                if not back_face and mesh_query.sign < 0.0:
-                    continue
-
-                t = mesh_query.t
-                hit_mesh_idx = i
-                hit_normal = mesh_query.normal
-                hit_point = ro + t * rd
-                hit_face_idx = mesh_query.face
-    else:
-        bvh_query = wp.bvh_query_ray(bvh_id, ro, rd)
-        i = wp.int32(0)
-
-        while wp.bvh_query_next(bvh_query, i):
-            # The ray intersects the volume with index i
-            mesh = meshes[i]
-            mesh_query = wp.mesh_query_ray(mesh.mesh_id, ro, rd, t)
-            if mesh_query.result and mesh_query.t < t and mesh_query.t > 0.0:
-                if not back_face and mesh_query.sign < 0.0:
-                    continue
-
-                t = mesh_query.t
-                hit_mesh_idx = i
-                hit_normal = mesh_query.normal
-                hit_point = ro + t * rd
-                hit_face_idx = mesh_query.face
-
-    return HitData(hit_mesh_idx, hit_face_idx, hit_point, hit_normal)
-
-
-@wp.func
-def light_sample(
-    rand_state: wp.uint32,
-    meshes: wp.array(dtype=Mesh),
-    light_indices: wp.array(dtype=int),
-) -> tuple[int, int, wp.vec3, wp.vec3, float]:
-    """
-    Sample a random point on the light sources in the scene.
-    Returns the mesh index (not warp mesh id) of the light source, the point on the light source, the normal, and the probability.
-    If there is no light in the scene, the mesh index is -1.
-    """
-    num_lights = len(light_indices)
-    if num_lights == 0:
-        return -1, -1, wp.vec3(0.0), wp.vec3(0.0), 0.0
-
-    light_idx = wp.randi(rand_state, 0, num_lights)
-    light_mesh = meshes[light_indices[light_idx]]
-
-    mesh_id = light_mesh.mesh_id
-    num_faces = light_mesh.num_faces
-    face_idx = wp.randi(rand_state, 0, num_faces)
-
-    normal = wp.mesh_eval_face_normal(mesh_id, face_idx)
-    v1, v2, v3 = get_triangle_points(mesh_id, face_idx)
-    pos, _, pdf = triangle_sample(rand_state, v1, v2, v3)
-
-    # this is not uniform area sampling wrt. all light surfaces
-    # but for simplicity we'll do it this way for now
-    pdf = pdf / float(num_lights * num_faces)
-    return light_indices[light_idx], face_idx, pos, normal, pdf
-
-
-@wp.func
-def compute_light_pdf(
-    p: wp.vec3,
-    face_idx: int,
-    light_mesh: Mesh,
-    light_indices: wp.array(dtype=int),
-) -> float:
-    """
-    Given a point on a light source, compute the PDF of sampling that point.
-    """
-    num_lights = len(light_indices)
-    if num_lights == 0:
-        return 0.0
-    num_faces = light_mesh.num_faces
-    if num_faces == 0:
-        return 0.0
-
-    v1, v2, v3 = get_triangle_points(light_mesh.mesh_id, face_idx)
-    area = 0.5 * wp.length(wp.cross(v2 - v1, v3 - v1))
-
-    return 1.0 / (area * float(num_lights * num_faces))
-
-
-@wp.func
-def is_visible(
-    bvh_id: wp.uint64,
-    target_mesh_idx: int,
-    target_face_idx: int,
-    p1: wp.vec3,
-    p2: wp.vec3,
-    meshes: wp.array(dtype=Mesh),
-):
-    """
-    Checks if a ray from p1 to p2 is occluded
-    """
-    p1p2 = p2 - p1
-    max_t = wp.length(p1p2)
-    rd = wp.normalize(p1p2)
-    origin = p1 + rd * EPSILON
-    hit_data = scene_intersect(bvh_id, origin, rd, meshes, max_t + EPSILON, True)
-    hit_mesh_idx = hit_data.mesh_idx
-    hit_face_idx = hit_data.face_idx
-    return hit_mesh_idx == target_mesh_idx and hit_face_idx == target_face_idx
 
 
 # ------------------------------------------------------------------------------------------------
@@ -477,12 +343,6 @@ def shade(
                 throughput, mat.emissive_color * mat.emissive_intensity
             )
 
-            # record emissive contribution for replay
-            if record_path_replay_data:
-                bounce_data = replay_bounce_data[replay_bounce_data_idx]
-                bounce_data.add_emissive = 1
-                replay_bounce_data[replay_bounce_data_idx] = bounce_data
-
         if not record_path_replay_data:
             # russain roulette
             # the brighter the path, the higher the chance of its survival
@@ -589,7 +449,7 @@ def replay_path(
         throughput = wp.cw_mul(throughput, f * wi.z / pdf)
         prev_bsdf_pdf = pdf
 
-        if rec.add_emissive != 0:
+        if is_emissive(mat):
             radiance += wp.cw_mul(
                 throughput, mat.emissive_color * mat.emissive_intensity
             )
@@ -996,7 +856,7 @@ class Renderer:
             pixels = wp.zeros(self.width * self.height, dtype=wp.vec3)
 
             wp.launch(
-                kernel=tonemap,
+                kernel=tonemap_kernel,
                 dim=self.width * self.height,
                 inputs=[self._radiances],
                 outputs=[pixels],
@@ -1129,7 +989,7 @@ def do_render_loop(
                 outputs=[replay_radiances],
             )
             wp.launch(
-                kernel=tonemap,
+                kernel=tonemap_kernel,
                 dim=renderer.width * renderer.height,
                 inputs=[replay_radiances],
                 outputs=[replay_pixels],
@@ -1363,6 +1223,7 @@ if __name__ == "__main__":
             )
         else:
             spp_min, spp_max = 1, args.spp
+
         if spp_max < spp_min:
             parser.error(f"--lr-spp-range requires min<=max; got {spp_min}:{spp_max}")
 
@@ -1503,7 +1364,7 @@ if __name__ == "__main__":
                         renderer.width * renderer.height, dtype=wp.vec3
                     )
                     wp.launch(
-                        kernel=tonemap,
+                        kernel=tonemap_kernel,
                         dim=renderer.width * renderer.height,
                         inputs=[target_radiances_wp],
                         outputs=[target_pixels_wp],
